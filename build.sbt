@@ -1,7 +1,9 @@
-val scalaV = "2.12.6"
-val specs2V = "4.3.2"
+val scalaV = "2.13.5"
+val scodecV = "1.11.7"
+val specs2V = "4.10.6"
 
 libraryDependencies ++= Seq(
+  "org.scodec" %% "scodec-core" % scodecV,
   "org.specs2" %% "specs2-core" % specs2V % "test"
 )
 
@@ -28,3 +30,5 @@ paradoxMaterialTheme in Compile := {
 paradoxProperties ++= Map(
   "github.base_url" -> (paradoxMaterialTheme in Compile).value.properties.getOrElse("repo", "")
 )
+
+fork in run := true

@@ -56,12 +56,16 @@ object Zstd {
       literals:    Literals,
       sequences:   Sequences
   ) extends Block
-  case class Literals(
+  case class LiteralSpec(
       literalsType:    Int,
       regeneratedSize: Int,
-      compressedSize:  Int,
-      data:            ByteVector
+      compressedSize:  Int
   )
+  case class Literals(
+      spec: LiteralSpec,
+      data: ByteVector
+  )
+
   sealed trait Offset
   case class DirectOffset(offset: Int) extends Offset
   case class RepeatedOffset(idx: Int) extends Offset
@@ -96,7 +100,15 @@ object Zstd {
     (provide(header) :: literals :: sequences).as[CompressedBlock]
   }
 
-  lazy val literals: Codec[Literals] = {
+  lazy val literals: Codec[Literals] =
+    literalSpec.flatZipHList { spec =>
+      spec.literalsType match {
+        case 0 => bytes(spec.compressedSize)
+        case 2 => variableSizeBytes(provide(spec.compressedSize), compressedLiterals)
+      }
+    }.as[Literals]
+
+  lazy val literalSpec: Codec[LiteralSpec] = {
     // FIXME: hard to decode because of weird bit order
     (uint4 :: uint2 :: uint2).consume {
       case lenBits :: sizeFormat :: tpe :: HNil =>
@@ -107,27 +119,116 @@ object Zstd {
               case 0 => lenBits << 1
               case 1 => lenBits << 1 + 1
             }
-            (provide(tpe) :: provide(len) :: provide(len) :: bytes(len)).as[Literals]
+            (provide(tpe) :: provide(len) :: provide(len)).as[LiteralSpec]
           case 2 => // Compressed_Literals_Block
-            sizeFormat match {
-              case 1 =>
-                uint16L.consume { len =>
-                  val regenSize = ((len & 0x3f) << 4) + lenBits
-                  val compSize = len >> 6
-                  //println(s"lenBits: ${lenBits.toHexString} len: ${len.toHexString} regenSize: $regenSize compSize: $compSize ${(len & 0x3f).toHexString}")
-                  (provide(tpe) :: provide(regenSize) :: provide(compSize) :: bytes(compSize)).as[Literals]
-                }(_ => ???)
-              case 2 =>
-                uint24L.consume { len =>
-                  val regenSize = (len & 0x3ff) << 4 + lenBits
-                  val compSize = len >> 10
-                  (provide(tpe) :: provide(regenSize) :: provide(compSize) :: bytes(compSize)).as[Literals]
-                }(_ => ???)
-            }
+            def sizes(sizeFormat: Int): Codec[Int :: Int :: HNil] =
+              sizeFormat match {
+                case 1 =>
+                  uint16L.consume { len =>
+                    val regenSize = ((len & 0x3f) << 4) + lenBits
+                    val compSize = len >> 6
+                    //println(s"lenBits: ${lenBits.toHexString} len: ${len.toHexString} regenSize: $regenSize compSize: $compSize ${(len & 0x3f).toHexString}")
+                    provide(regenSize) :: provide(compSize)
+                  }(_ => ???)
+                case 2 =>
+                  uint24L.consume { len =>
+                    val regenSize = (len & 0x3ff) << 4 + lenBits
+                    val compSize = len >> 10
+                    provide(regenSize) :: provide(compSize)
+                  }(_ => ???)
+              }
 
+            //println("got here")
+
+            (provide(tpe) :: sizes(sizeFormat)).as[LiteralSpec]
         }
     }(_ => ???)
   }
+
+  case class HuffmanSpec(maxNumberOfBits: Int, weights: Seq[Int]) {
+    lazy val maxWeight = weights.max
+    override def toString: String = s"Huffman weights total: ${weights.sum} max: $maxWeight\n" + weights.zipWithIndex.collect {
+      case (weight, idx) if weight > 0 => f"$idx%2x ${char(idx)} weight $weight%2d bits ${maxNumberOfBits + 1 - weight} "
+    }.mkString("\n")
+    private def char(idx: Int): String =
+      idx match {
+        case 0xa         => "'\\n'"
+        case 0xd         => "'\\r'"
+        case x if x < 32 => " .  "
+        case x           => s" '${x.toChar.toString}'"
+      }
+  }
+  object HuffmanSpec {
+    def apply(collectedWeights: Seq[Int]): HuffmanSpec = {
+      val totalWeights =
+        collectedWeights.collect {
+          case x if x > 0 => 1 << (x - 1)
+        }.sum
+      val nextPowerOf2 = java.lang.Integer.highestOneBit(totalWeights) << 1
+      val maxNumberOfBits = java.lang.Integer.numberOfTrailingZeros(nextPowerOf2)
+      val remainingBins = nextPowerOf2 - totalWeights
+      val lastWeight = java.lang.Integer.numberOfTrailingZeros(remainingBins) + 1
+      println(s"totalWeights: $totalWeights nextPowerOf2: $nextPowerOf2 remaining: $remainingBins last weight: $lastWeight")
+
+      new HuffmanSpec(maxNumberOfBits, collectedWeights :+ lastWeight)
+    }
+  }
+  //case class HuffmanTable(entries: Seq[])
+
+  def ifEnoughDataAvailable[T](inner: Codec[T]): Codec[Option[T]] =
+    lookahead(inner.xmap[Unit](_ => (), _ => ???)).consume[Option[T]] { canRead =>
+      if (canRead) inner.xmap[Option[T]](Some(_), _ => ???)
+      else provide(None)
+    }(_ => ???)
+
+  lazy val huffmanSpec: Codec[HuffmanSpec] = {
+    fseTableSpec.consume { tableSpec =>
+      val table = tableSpec.toTable
+      println(s"Huffman table weights FSE: $table")
+      def nextValues(state1: Int, state2: Int, current: Seq[Int]): Codec[HuffmanSpec] = {
+        val v1Entry = table.entries(state1)
+        val v2Entry = table.entries(state2)
+        println(s"Read entries ${v1Entry.symbol} ${v2Entry.symbol}")
+
+        ifEnoughDataAvailable(readExtra(v1Entry.nbBits) :: readExtra(v2Entry.nbBits)).consume {
+          case Some(newState1 :: newState2 :: HNil) =>
+            nextValues(newState1 + v1Entry.offset, newState2 + v2Entry.offset, current ++ Seq(v1Entry.symbol, v2Entry.symbol))
+          case None =>
+            ifEnoughDataAvailable(readExtra(v1Entry.nbBits)).consume {
+              case Some(newState1) =>
+                provide(HuffmanSpec(current ++ Seq(v1Entry.symbol, v2Entry.symbol, table.entries(newState1).symbol)))
+              case None => provide(HuffmanSpec(current ++ Seq(v1Entry.symbol, v2Entry.symbol)))
+            }(_ => ???)
+        }(_ => ???)
+
+        //provide(HuffmanSpec(Nil))
+      }
+
+      reversed {
+        withReversedBits {
+          (padding ~> uint(tableSpec.accuracyLog) :: uint(tableSpec.accuracyLog)).consume {
+            case state1 :: state2 :: HNil =>
+              println(s"Start states state1: $state1 state2: $state2")
+              nextValues(state1, state2, Nil)
+          }(_ => ???)
+        }
+      }
+    }(_ => ???)
+  }
+  def padding: Codec[Unit] =
+    peek(uint8).consume { first =>
+      val padding = java.lang.Integer.numberOfLeadingZeros(first) - 24 + 1
+
+      ignore(padding)
+    }(_ => ???)
+
+  def compressedLiterals: Codec[ByteVector] =
+    variableSizeBytes(uint8, huffmanSpec).consume { huffmanSpec =>
+      println(s"Huffman Spec: $huffmanSpec")
+      provide(ByteVector.empty)
+    }(_ => ???)
+
+  def readExtra(bits: Int): Codec[Int] = if (bits == 0) provide(0) else uint(bits)
 
   lazy val sequences: Codec[Sequences] =
     sequenceSectionHeader.consume { header =>
@@ -144,62 +245,56 @@ object Zstd {
 
       reversed {
         withReversedBits {
-          peek(uint8).consume { first =>
-            val padding = java.lang.Integer.numberOfLeadingZeros(first) - 24 + 1
+          (padding ~> uint(header.litLengthTable.accuracyLog) :: uint(header.offsetTable.accuracyLog) :: uint(header.matchLengthTable.accuracyLog)).consume {
+            case litLenState :: offsetState :: matchLenState :: HNil =>
+              println(litLenState, offsetState, matchLenState)
 
-            (ignore(padding) ~> uint(header.litLengthTable.accuracyLog) :: uint(header.offsetTable.accuracyLog) :: uint(header.matchLengthTable.accuracyLog)).consume {
-              case litLenState :: offsetState :: matchLenState :: HNil =>
-                println(litLenState, offsetState, matchLenState)
+              def nextSequence(remaining: Int, litLenState: Int, offsetState: Int, matchLenState: Int, current: Vector[Sequence]): Codec[Seq[Sequence]] =
+                if (remaining == 0) provide(current)
+                else {
+                  // offset, matchlen, lit
+                  val offsetEntry = offsetTable.entries(offsetState)
 
-                def nextSequence(remaining: Int, litLenState: Int, offsetState: Int, matchLenState: Int, current: Vector[Sequence]): Codec[Seq[Sequence]] =
-                  if (remaining == 0) provide(current)
-                  else {
-                    // offset, matchlen, lit
-                    val offsetEntry = offsetTable.entries(offsetState)
+                  println(s"Offset entry: $offsetEntry")
+                  val offsetCode = offsetEntry.symbol
 
-                    println(s"Offset entry: $offsetEntry")
-                    val offsetCode = offsetEntry.symbol
+                  readExtra(offsetCode).consume { extra =>
+                    val offsetValue = (1 << offsetCode) + extra
+                    val offset =
+                      if (offsetValue > 3) DirectOffset(offsetValue - 3)
+                      else RepeatedOffset(offsetValue)
 
-                    def readExtra(bits: Int): Codec[Int] = if (bits == 0) provide(0) else uint(bits)
+                    println(s"Offset: $offset")
 
-                    readExtra(offsetCode).consume { extra =>
-                      val offsetValue = (1 << offsetCode) + extra
-                      val offset =
-                        if (offsetValue > 3) DirectOffset(offsetValue - 3)
-                        else RepeatedOffset(offsetValue)
+                    val matchLenEntry = matchLenTable.entries(matchLenState)
+                    val matchLenCode = MatchLenCodes(matchLenEntry.symbol)
+                    readExtra(matchLenCode.extraBits).consume { extra =>
+                      val matchLen = matchLenCode.baseline + extra
+                      println(s"MatchLen: $matchLen")
 
-                      println(s"Offset: $offset")
+                      val litLenEntry = litLenTable.entries(litLenState)
+                      val litLenCode = LitLenCodes(litLenEntry.symbol)
 
-                      val matchLenEntry = matchLenTable.entries(matchLenState)
-                      val matchLenCode = MatchLenCodes(matchLenEntry.symbol)
-                      readExtra(matchLenCode.extraBits).consume { extra =>
-                        val matchLen = matchLenCode.baseline + extra
-                        println(s"MatchLen: $matchLen")
+                      readExtra(litLenCode.extraBits).consume { extra =>
+                        val litLen = litLenCode.baseline + extra
+                        println(s"LitLen: $litLen")
 
-                        val litLenEntry = litLenTable.entries(litLenState)
-                        val litLenCode = LitLenCodes(litLenEntry.symbol)
+                        val allSeqs: Vector[Sequence] = current :+ Sequence(litLen, matchLen, offset)
+                        if (remaining > 1)
+                          // state update: `Literals_Length_State` is updated, followed by `Match_Length_State`, and then `Offset_State`
+                          (uint(litLenEntry.nbBits) :: uint(matchLenEntry.nbBits) :: uint(offsetEntry.nbBits)).consume {
+                            case ll :: ml :: o :: HNil =>
+                              nextSequence(remaining - 1, ll + litLenEntry.offset, o + offsetEntry.offset, ml + matchLenEntry.offset, allSeqs)
+                          }(_ => ???)
+                        else provide(allSeqs: Seq[Sequence])
 
-                        readExtra(litLenCode.extraBits).consume { extra =>
-                          val litLen = litLenCode.baseline + extra
-                          println(s"LitLen: $litLen")
-
-                          val allSeqs: Vector[Sequence] = current :+ Sequence(litLen, matchLen, offset)
-                          if (remaining > 1)
-                            // state update: `Literals_Length_State` is updated, followed by `Match_Length_State`, and then `Offset_State`
-                            (uint(litLenEntry.nbBits) :: uint(matchLenEntry.nbBits) :: uint(offsetEntry.nbBits)).consume {
-                              case ll :: ml :: o :: HNil =>
-                                nextSequence(remaining - 1, ll + litLenEntry.offset, o + offsetEntry.offset, ml + matchLenEntry.offset, allSeqs)
-                            }(_ => ???)
-                          else provide(allSeqs: Seq[Sequence])
-
-                        }(_ => ???)
                       }(_ => ???)
-
                     }(_ => ???)
-                  }
 
-                (provide(header) :: nextSequence(header.numberOfSequences, litLenState, offsetState, matchLenState, Vector.empty)).as[Sequences]
-            }(_ => ???)
+                  }(_ => ???)
+                }
+
+              (provide(header) :: nextSequence(header.numberOfSequences, litLenState, offsetState, matchLenState, Vector.empty)).as[Sequences]
           }(_ => ???)
         }
       }
@@ -473,6 +568,7 @@ object ZstdTest extends App {
   println(Zstd.frameHeaderDesc.sizeBound)
   val res = Zstd.frame.decode(data.toBitVector)
   println(s"Result: $res")
+  if (res.isFailure) println(s"Context: ${res.toEither.left.get.context}")
 }
 
 /*
@@ -508,6 +604,102 @@ manual decode of jsondata.zst
 000001b0  0a 0d 63 63 23 0d 8b 23  e8 92 b3 c5 3e 1b e3 8b  |..cc#..#....>...|
 000001c0  60 07 cb d3 df 47                                 |`....G|
 
+24 <- header byte = 36 = huffman table size
+30 6d f4 0c 63 28 2b 0b 69 ce  da 88 8c fc b1 c6 0a 27 ce aa 6b 0e 7f 8d 34 61  e5 a6 5f 04 67 58 18 74 8c 03 => huffman table?
+
+30        6d        f4        0c        63
+0011 0000 0110 1101 1111 0100 0000 1100 0110 0011
+
+0000 <- low4bits = 0 accuracy = 1<<5 remaining = 33 read 6 or 5 bits 63-33 = 30, 0-29 use 5 bits
+1 0011 <- 19, realcount = 18, sym 0, remaining 15, read 4 or 3 bits, 15-15 = 0, always use 4 bits
+0 110 <- 6, realcount = 5, sym 1, remaining 10, read 4 or 3 bits, 15-10 = 5, 0-4 use 3 bits
+011 <- 3, realcount = 2, sym 2, remaining 8, read 4 or 3 bits, 15-8=7, 0-6 use 3 bits
+100 <- 4, realcount = 3, sym 3, remaining 5, read 3 or 2 bits, 7-5=2, 0-1 use 2 bits
+11 0 <- 4, realcount = 3, sym 4, remaining 2, read 2 or 1 bits, 3-2=1, 0 use 1 bits
+11 <- 2, realcount = 1, sym 5, remaining 1
+
+63        0c
+0110 0011 0000 1100 11 <- after reading FSE table
+
+ 0  0  1  4
+ 1  0  1  6
+ 2  0  1  8
+ 3  1  3  8
+ 4  4  4 16
+ 5  0  1 10
+ 6  0  1 12
+ 7  0  1 14
+ 8  2  4  0
+ 9  5  5  0
+10  0  1 16
+11  0  1 18
+12  1  3 16
+13  3  4 16
+14  0  1 20
+15  0  1 22
+16  0  1 24
+17  2  4 16
+18  4  3  0
+19  0  1 26
+20  0  1 28
+21  1  3 24
+22  3  3  0
+23  0  1 30
+24  0  0  0
+25  0  0  1
+26  1  2  0
+27  4  3  8
+28  0  0  2
+29  0  0  3
+30  1  2  4
+31  3  3  8
+
+67 58 18 74 8c 03
+0110 0111 0101 1000 0001 1000 0111 0100 1000 1100 0000 0011
+
+0000 001 padding
+11000 <- state1=24, sym 0, count 0, 0 bits, next state 0
+11000 <- state2=24, sym 1, count 0, 0 bits, next state 0
+
+state1 = 0 sym 2, count 0, 1 bits, offset 4
+1 <- new state1 = 5
+state1 = 0 sym 3, count 0, 1 bits, offset 4
+1 <- new state2 = 5
+
+111 0100 0001 1000 0101 1000 0110 011
+
+Actual literals
+
+          4c 00 4a 00 51 00  2e fd 3e 64 79 50 74 a2  |..L.J.Q...>dyPt.|
+00000040  b3 de 3a 17 49 ab 44 f2  89 6b a9 64 b9 3f b1 9c  |..:.I.D..k.d.?..|
+00000050  68 04 2b d5 53 92 4f 6b  7f 4e 94 95 8a 7a c7 74  |h.+.S.Ok.N...z.t|
+00000060  c0 91 3f 32 b9 b6 2a cc  5c 74 5c 5c ab d1 6c 01  |..?2..*.\t\\..l.|
+00000070  7b 01 57 33 8e 2c 7f aa  f4 fa db 88 2b 22 4f ec  |{.W3.,......+"O.|
+00000080  9d 9e 2b 02 ae 57 e4 a7  a0 0c 2f d1 f9 13 92 cf  |..+..W..../.....|
+00000090  86 bd f5 5a b7 e6 ff 78  3f 94 ae c1 7e 10 ce 68  |...Z...x?...~..h|
+000000a0  ba 74 1c 67 c2 39 9f eb  d8 ce ba 0b b6 dc c2 1f  |.t.g.9..........|
+000000b0  14 47 be ac 38 34 44 a6  ee 3b ac 37 26 d6 e5 54  |.G..84D..;.7&..T|
+000000c0  a3 a7 58 a9 16 65 5f c2  0a fb 75 82 c5 6f 1d d9  |..X..e_...u..o..|
+000000d0  26 48 54 35 f2 56 21 e0  52 2f 10 70 a9 75 06 c3  |&HT5.V!.R/.p.u..|
+000000e0  44 20 97 a1 ea ad 05 0c  f5 d3 e4 8f 0a c1 3c a4  |D ............<.|
+000000f0  3e 18 8e fc b8 be e0 88  40 2c ab b9 f6 ac 87 87  |>.......@,......|
+00000100  35 0d f1 04 f9 74 52 59  19 dc 74 84 2e 3a ab f1  |5....tRY..t..:..|
+00000110  ac 1f 78 89 16 48 3e 51  07 b5 95 95 d5 3c 30 00  |..x..H>Q.....<0.|
+00000120  15 5b 4e 83 ac 71 8f 73  bd a0 e6 91 0f 83 2b 82  |.[N..q.s......+.|
+00000130  2e a5 7b f8 cf 6a 50 fb  67 2b 9a f2 35 64 0d 49  |..{..jP.g+..5d.I|
+00000140  68 b1 c1 02 c2 f2 ba b1  07 03 c6 01 6b f8 1a 63  |h...........k..c|
+00000150  ce 98 9c 8b 45 af 1b 8a  da 6c 3f 27 f3 07 72 a7  |....E....l?'..r.|
+00000160  1f 83 1e 8c 9e 74 b2 3d  80 2a 21 20
+
+
+4c 00 4a 00 51 00 <- jump table
+
+4c 00 <- stream1 len =
+4a 00 <- stream2 len =
+51 00 <- stream3 len =
+stream4 =
+
+Sequences:
 
 80 a2 81 b2 <- start of offset fse table desc
 

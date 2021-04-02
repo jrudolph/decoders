@@ -59,7 +59,8 @@ object Zstd {
   case class LiteralSpec(
       literalsType:    Int,
       regeneratedSize: Int,
-      compressedSize:  Int
+      compressedSize:  Int,
+      numStreams:      Int
   )
   case class Literals(
       spec: LiteralSpec,
@@ -104,7 +105,7 @@ object Zstd {
     literalSpec.flatZipHList { spec =>
       spec.literalsType match {
         case 0 => bytes(spec.compressedSize)
-        case 2 => variableSizeBytes(provide(spec.compressedSize), compressedLiterals)
+        case 2 => variableSizeBytes(provide(spec.compressedSize), compressedLiterals(spec))
       }
     }.as[Literals]
 
@@ -119,22 +120,22 @@ object Zstd {
               case 0 => lenBits << 1
               case 1 => lenBits << 1 + 1
             }
-            (provide(tpe) :: provide(len) :: provide(len)).as[LiteralSpec]
+            (provide(tpe) :: provide(len) :: provide(len) :: provide(1)).as[LiteralSpec]
           case 2 => // Compressed_Literals_Block
-            def sizes(sizeFormat: Int): Codec[Int :: Int :: HNil] =
+            def sizes(sizeFormat: Int): Codec[Int :: Int :: Int :: HNil] =
               sizeFormat match {
                 case 1 =>
                   uint16L.consume { len =>
                     val regenSize = ((len & 0x3f) << 4) + lenBits
                     val compSize = len >> 6
                     //println(s"lenBits: ${lenBits.toHexString} len: ${len.toHexString} regenSize: $regenSize compSize: $compSize ${(len & 0x3f).toHexString}")
-                    provide(regenSize) :: provide(compSize)
+                    provide(regenSize) :: provide(compSize) :: provide(4)
                   }(_ => ???)
                 case 2 =>
                   uint24L.consume { len =>
                     val regenSize = (len & 0x3ff) << 4 + lenBits
                     val compSize = len >> 10
-                    provide(regenSize) :: provide(compSize)
+                    provide(regenSize) :: provide(compSize) :: provide(4)
                   }(_ => ???)
               }
 
@@ -147,16 +148,25 @@ object Zstd {
 
   case class HuffmanSpec(maxNumberOfBits: Int, weights: Seq[Int]) {
     lazy val maxWeight = weights.max
-    override def toString: String = s"Huffman weights total: ${weights.sum} max: $maxWeight\n" + weights.zipWithIndex.collect {
+    override def toString: String = s"Huffman weights total: ${weights.sum} maxNumberOfBits: $maxNumberOfBits max: $maxWeight\n" + weights.zipWithIndex.collect {
       case (weight, idx) if weight > 0 => f"$idx%2x ${char(idx)} weight $weight%2d bits ${maxNumberOfBits + 1 - weight} "
     }.mkString("\n")
-    private def char(idx: Int): String =
-      idx match {
-        case 0xa         => "'\\n'"
-        case 0xd         => "'\\r'"
-        case x if x < 32 => " .  "
-        case x           => s" '${x.toChar.toString}'"
-      }
+
+    def toTable: HuffmanTable = {
+      val sorted = weights.zipWithIndex.filter(_._1 > 0).sorted
+      val first = sorted.head
+      val firstBits = maxNumberOfBits + 1 - first._1
+      val entries =
+        sorted.tail.scanLeft(HuffmanEntry(first._2, first._1, firstBits, 0, 0, (1 << firstBits) - 1)) { (last, next) =>
+          val weight = next._1
+          val sym = next._2
+          val numberOfBits = maxNumberOfBits + 1 - weight
+          val nextNum = (last.code + 1) >> (weight - last.weight)
+
+          HuffmanEntry(sym, weight, numberOfBits, nextNum, nextNum << (maxNumberOfBits - numberOfBits), ((1 << numberOfBits) - 1) << (maxNumberOfBits - numberOfBits))
+        }
+      HuffmanTable(maxNumberOfBits, entries)
+    }
   }
   object HuffmanSpec {
     def apply(collectedWeights: Seq[Int]): HuffmanSpec = {
@@ -173,7 +183,33 @@ object Zstd {
       new HuffmanSpec(maxNumberOfBits, collectedWeights :+ lastWeight)
     }
   }
-  //case class HuffmanTable(entries: Seq[])
+  case class HuffmanEntry(symbol: Int, weight: Int, numberOfBits: Int, code: Int, shiftedCode: Int, mask: Int) {
+    def toString(maxNumberOfBits: Int): String = f"${binStringWithLeftZeros(code, numberOfBits)}%10s ${binStringWithLeftZeros(shiftedCode, maxNumberOfBits)} ${mask.toBinaryString} ${numberOfBits}%2d bits => ${char(symbol)}"
+  }
+
+  case class HuffmanTable(maxNumberOfBits: Int, entries: Seq[HuffmanEntry]) {
+    override def toString: String =
+      entries.map(_.toString(maxNumberOfBits)).mkString("\n")
+
+    /** code should contain `maxNumberOfBits` of new data */
+    def read(code: Int): HuffmanEntry =
+      entries.find { e =>
+        val masked = code & e.mask
+        //println(s"${masked.toBinaryString} ${e.shiftedCode.toBinaryString} ${(code & e.mask) == e.code} at ${e.toString(maxNumberOfBits)}")
+        (code & e.mask) == e.shiftedCode
+      }.get
+  }
+  private def binStringWithLeftZeros(num: Int, numberOfBits: Int): String = {
+    val str = num.toBinaryString
+    "0" * (numberOfBits - str.size) + str
+  }
+  private def char(idx: Int): String =
+    idx match {
+      case 0xa         => "'\\n'"
+      case 0xd         => "'\\r'"
+      case x if x < 32 => " .  "
+      case x           => s" '${x.toChar.toString}'"
+    }
 
   def ifEnoughDataAvailable[T](inner: Codec[T]): Codec[Option[T]] =
     lookahead(inner.xmap[Unit](_ => (), _ => ???)).consume[Option[T]] { canRead =>
@@ -200,8 +236,6 @@ object Zstd {
               case None => provide(HuffmanSpec(current ++ Seq(v1Entry.symbol, v2Entry.symbol)))
             }(_ => ???)
         }(_ => ???)
-
-        //provide(HuffmanSpec(Nil))
       }
 
       reversed {
@@ -222,11 +256,48 @@ object Zstd {
       ignore(padding)
     }(_ => ???)
 
-  def compressedLiterals: Codec[ByteVector] =
+  def compressedLiterals(spec: LiteralSpec): Codec[ByteVector] =
     variableSizeBytes(uint8, huffmanSpec).consume { huffmanSpec =>
       println(s"Huffman Spec: $huffmanSpec")
-      provide(ByteVector.empty)
+      println(huffmanSpec.toTable)
+
+      if (spec.numStreams == 4)
+        (uint16L :: uint16L :: uint16L).consume {
+          case stream1 :: stream2 :: stream3 :: HNil =>
+            val numEls = (spec.regeneratedSize + 3) / 4
+            val remaining = spec.regeneratedSize - 3 * numEls
+
+            (variableSizeBytes(provide(stream1), decodeLiterals(huffmanSpec, numEls)) ::
+              variableSizeBytes(provide(stream2), decodeLiterals(huffmanSpec, numEls)) ::
+              variableSizeBytes(provide(stream3), decodeLiterals(huffmanSpec, numEls)) ::
+              decodeLiterals(huffmanSpec, remaining)).xmap[ByteVector]({
+                case s1 :: s2 :: s3 :: s4 :: HNil => s1 ++ s2 ++ s3 ++ s4
+              }, _ => ???)
+        }(_ => ???)
+      else
+        decodeLiterals(huffmanSpec, spec.regeneratedSize)
     }(_ => ???)
+
+  def decodeLiterals(huffmanSpec: HuffmanSpec, numElements: Int): Codec[ByteVector] = {
+    val table = huffmanSpec.toTable
+
+    reversed {
+      withReversedBits {
+        appendInput(ByteVector(0)) {
+          def readOne: Codec[Int] =
+            peek(uint(table.maxNumberOfBits)).consume { v =>
+              println(s"Read ${v.toBinaryString}")
+              val entry = table.read(v)
+              println(s"Found entry: $entry")
+
+              ignore(entry.numberOfBits) ~> provide(entry.symbol)
+            }(_ => ???)
+
+          padding ~> vectorOfN(provide(numElements), readOne).xmap[ByteVector](bs => ByteVector(bs: _*), _ => ???)
+        }
+      }
+    }
+  }
 
   def readExtra(bits: Int): Codec[Int] = if (bits == 0) provide(0) else uint(bits)
 
@@ -474,21 +545,18 @@ object Zstd {
   /**
    * Reverses bits while running inner codec
    */
-  def withReversedBits[T](inner: Codec[T]): Codec[T] =
-    new Codec[T] {
-      override def decode(bits: BitVector): Attempt[DecodeResult[T]] =
-        inner.decode(bits.reverseBitOrder).map(_.mapRemainder(_.reverseBitOrder))
-      override def encode(value: T): Attempt[BitVector] =
-        inner.encode(value).map(_.reverseBitOrder)
-      override def sizeBound: SizeBound = inner.sizeBound
-    }
+  def withReversedBits[T](inner: Codec[T]): Codec[T] = mapInputBits(_.reverseBitOrder)(inner)
+  def reversed[T](inner: Codec[T]): Codec[T] = mapInputBits(_.reverse)(inner)
+  def appendInput[T](byteVector: ByteVector)(inner: Codec[T]): Codec[T] =
+    mapInputBits(_ ++ byteVector.toBitVector, _.dropRight(byteVector.length * 8))(inner)
 
-  def reversed[T](inner: Codec[T]): Codec[T] =
+  def mapInputBits[T](bi: BitVector => BitVector)(inner: Codec[T]): Codec[T] = mapInputBits(bi, bi)(inner)
+  def mapInputBits[T](forward: BitVector => BitVector, backward: BitVector => BitVector)(inner: Codec[T]): Codec[T] =
     new Codec[T] {
       override def decode(bits: BitVector): Attempt[DecodeResult[T]] =
-        inner.decode(bits.reverse).map(_.mapRemainder(_.reverse))
+        inner.decode(forward(bits)).map(_.mapRemainder(backward))
       override def encode(value: T): Attempt[BitVector] =
-        inner.encode(value).map(_.reverse)
+        inner.encode(value).map(backward)
       override def sizeBound: SizeBound = inner.sizeBound
     }
 
@@ -552,6 +620,11 @@ object Zstd {
   def peekPrintNextBits(num: Int, tag: String): Codec[Unit] =
     peek(bits(num)).xmap({ bv => println(s"$tag: ${bv.toBin}") }, _ => ???)
 
+  def peekPrintNextBytes(num: Int, tag: String): Codec[Unit] =
+    peek(bytes(num)).xmap({ bv => println(s"$tag: ${bv.toHex}") }, _ => ???)
+
+  def peekRemainingBytes(tag: String): Codec[Unit] =
+    peek(bytes.xmap({ bv => println(s"$tag: ${bv.size} bytes ${bv.toHex}") }, _ => ???))
 }
 
 object ZstdTest extends App {
@@ -670,7 +743,7 @@ state1 = 0 sym 3, count 0, 1 bits, offset 4
 
 Actual literals
 
-          4c 00 4a 00 51 00  2e fd 3e 64 79 50 74 a2  |..L.J.Q...>dyPt.|
+                4c 00 4a 00 51 00  2e fd 3e 64 79 50 74 a2  |..L.J.Q...>dyPt.|
 00000040  b3 de 3a 17 49 ab 44 f2  89 6b a9 64 b9 3f b1 9c  |..:.I.D..k.d.?..|
 00000050  68 04 2b d5 53 92 4f 6b  7f 4e 94 95 8a 7a c7 74  |h.+.S.Ok.N...z.t|
 00000060  c0 91 3f 32 b9 b6 2a cc  5c 74 5c 5c ab d1 6c 01  |..?2..*.\t\\..l.|
@@ -689,17 +762,106 @@ Actual literals
 00000130  2e a5 7b f8 cf 6a 50 fb  67 2b 9a f2 35 64 0d 49  |..{..jP.g+..5d.I|
 00000140  68 b1 c1 02 c2 f2 ba b1  07 03 c6 01 6b f8 1a 63  |h...........k..c|
 00000150  ce 98 9c 8b 45 af 1b 8a  da 6c 3f 27 f3 07 72 a7  |....E....l?'..r.|
-00000160  1f 83 1e 8c 9e 74 b2 3d  80 2a 21 20
+00000160  1f 83 1e 8c 9e 74 b2 3d  80 2a
 
 
 4c 00 4a 00 51 00 <- jump table
 
-4c 00 <- stream1 len =
-4a 00 <- stream2 len =
-51 00 <- stream3 len =
-stream4 =
+4c 00 <- stream1 len = 74
+4a 00 <- stream2 len = 76
+51 00 <- stream3 len = 81
+stream4 = 349 - 231 ///* stream 1 - 3 */ - 6 /* jump table */ - 1 /* huffman header size */ - 36 /* huffman table */ = 75
+
+Huffman table:
+
+00000000  8 bits => '\n'
+00000001  8 bits =>  ' '
+00000010  8 bits =>  'B'
+00000011  8 bits =>  'C'
+00000100  8 bits =>  'D'
+00000101  8 bits =>  'F'
+00000110  8 bits =>  'G'
+00000111  8 bits =>  'I'
+00001000  8 bits =>  'J'
+00001001  8 bits =>  'N'
+00001010  8 bits =>  'O'
+00001011  8 bits =>  'P'
+00001100  8 bits =>  'S'
+00001101  8 bits =>  '['
+00001110  8 bits =>  ']'
+00001111  8 bits =>  '_'
+00010000  8 bits =>  'j'
+00010001  8 bits =>  'k'
+00010010  8 bits =>  'q'
+00010011  8 bits =>  'u'
+00010100  8 bits =>  'z'
+00010101  8 bits =>  '{'
+ 0001011  7 bits =>  '-'
+ 0001100  7 bits =>  'M'
+ 0001101  7 bits =>  'T'
+ 0001110  7 bits =>  'g'
+ 0001111  7 bits =>  'h'
+ 0010000  7 bits =>  'm'
+ 0010001  7 bits =>  'p'
+ 0010010  7 bits =>  'v'
+ 0010011  7 bits =>  'y'
+  001010  6 bits =>  ','
+  001011  6 bits =>  '.'
+  001100  6 bits =>  '/'
+  001101  6 bits =>  '3'
+  001110  6 bits =>  '6'
+  001111  6 bits =>  '9'
+  010000  6 bits =>  'b'
+  010001  6 bits =>  'c'
+  010010  6 bits =>  'l'
+  010011  6 bits =>  'n'
+  010100  6 bits =>  's'
+  010101  6 bits =>  '}'
+   01011  5 bits =>  '1'
+   01100  5 bits =>  '2'
+   01101  5 bits =>  '4'
+   01110  5 bits =>  '5'
+   01111  5 bits =>  '7'
+   10000  5 bits =>  '8'
+   10001  5 bits =>  ':'
+   10010  5 bits =>  'd'
+   10011  5 bits =>  'f'
+   10100  5 bits =>  'i'
+   10101  5 bits =>  'o'
+   10110  5 bits =>  'r'
+   10111  5 bits =>  't'
+    1100  4 bits =>  '"'
+    1101  4 bits =>  '0'
+    1110  4 bits =>  'a'
+    1111  4 bits =>  'e'
+
+
+stream1 bytes: 2efd3e64795074a2b3de3a1749ab44f2896ba964b93fb19c68042bd553924f6b7f4e94958a7ac774c0913f32b9b62acc5c745c5cabd16c017b0157338e2c7faaf4fadb882b224fec9d9e2b02
+
+02 2b 9e 9d
+
+ec 4f 22 2b 88
+
+
+0000 001   <- padding
+0 0010 101 <- '{'
+1 100 <- '"'
+1 111 <- 'e'
+0 1001 1 <- 'n'
+10111 <- 't'
+10110 <- 'r'
+0 0100 11 <- 'y'
+11 00 <- '"'
+10 001 <- ':'
+0 0010 101 <- '{'
+1 100 <- '"'
+0 1000
+
+0010011
 
 Sequences:
+21 <- num sequences -> 33
+20 = 0010 0000 <- offsets need custom table
 
 80 a2 81 b2 <- start of offset fse table desc
 

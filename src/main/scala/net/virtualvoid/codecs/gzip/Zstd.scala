@@ -559,13 +559,6 @@ object Zstd {
   def appendInput[T](byteVector: ByteVector)(inner: Codec[T]): Codec[T] =
     mapInputBits(_ ++ byteVector.toBitVector, _.dropRight(byteVector.length * 8))(inner)
 
-  def skipToNextBytes[T](inner: Codec[T]): Codec[T] = new Codec[T] {
-    override def decode(bits: BitVector): Attempt[DecodeResult[T]] =
-      inner.decode(bits).map(_.mapRemainder(bs => bs.drop(bs.size % 8)))
-    override def encode(value: T): Attempt[BitVector] = ???
-    override def sizeBound: SizeBound = inner.sizeBound
-  }
-
   def mapInputBits[T](bi: BitVector => BitVector)(inner: Codec[T]): Codec[T] = mapInputBits(bi, bi)(inner)
   def mapInputBits[T](forward: BitVector => BitVector, backward: BitVector => BitVector)(inner: Codec[T]): Codec[T] =
     new Codec[T] {
@@ -582,7 +575,7 @@ object Zstd {
   def uintLEBits(bits: Int): Codec[Int] = limitedSizeBits(bits, withReversedBits(uintL(bits)))
 
   lazy val fseTableSpec: Codec[FSETableSpec] = withReversedBits {
-    skipToNextBytes {
+    byteAligned {
 
       case class ReadState(accuracyLog: Int, remaining: Int, counts: Seq[Int]) {
         def next: Codec[FSETableSpec] =

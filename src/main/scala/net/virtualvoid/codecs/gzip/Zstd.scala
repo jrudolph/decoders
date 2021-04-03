@@ -399,7 +399,12 @@ object Zstd {
     uint8.consume[Int] {
       case 0            => provide(0)
       case x if x < 128 => provide(x)
-      // FIXME: support remaining modes
+      case x if x < 255 =>
+        // ((byte0-128) << 8) + byte1
+        uint8.xmap(byte1 => ((x - 128) << 8) + byte1, _ => ???)
+      case 255 =>
+        // byte1 + (byte2<<8) + 0x7F00
+        uint16L.xmap(_ + 0x7f00, _ => ???)
     }(_ => ???)
 
   case class FSETableSpec(

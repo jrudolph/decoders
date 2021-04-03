@@ -353,7 +353,7 @@ object Zstd {
                         val allSeqs: Vector[Sequence] = current :+ Sequence(litLen, matchLen, offset)
                         if (remaining > 1)
                           // state update: `Literals_Length_State` is updated, followed by `Match_Length_State`, and then `Offset_State`
-                          (uint(litLenEntry.nbBits) :: uint(matchLenEntry.nbBits) :: uint(offsetEntry.nbBits)).consume {
+                          (readExtra(litLenEntry.nbBits) :: readExtra(matchLenEntry.nbBits) :: readExtra(offsetEntry.nbBits)).consume {
                             case ll :: ml :: o :: HNil =>
                               nextSequence(remaining - 1, ll + litLenEntry.offset, o + offsetEntry.offset, ml + matchLenEntry.offset, allSeqs)
                           }(_ => ???)

@@ -194,7 +194,7 @@ object Zstd {
     /** code should contain `maxNumberOfBits` of new data */
     def read(code: Int): HuffmanEntry =
       entries.find { e =>
-        val masked = code & e.mask
+        //val masked = code & e.mask
         //println(s"${masked.toBinaryString} ${e.shiftedCode.toBinaryString} ${(code & e.mask) == e.code} at ${e.toString(maxNumberOfBits)}")
         (code & e.mask) == e.shiftedCode
       }.get
@@ -258,7 +258,7 @@ object Zstd {
 
   def compressedLiterals(spec: LiteralSpec): Codec[ByteVector] =
     variableSizeBytes(uint8, huffmanSpec).consume { huffmanSpec =>
-      println(s"Huffman Spec: $huffmanSpec")
+      println(s"Lit Spec: $spec Huffman Spec: $huffmanSpec")
       println(huffmanSpec.toTable)
 
       if (spec.numStreams == 4)
@@ -286,9 +286,9 @@ object Zstd {
         appendInput(ByteVector(0)) {
           def readOne: Codec[Int] =
             peek(uint(table.maxNumberOfBits)).consume { v =>
-              println(s"Read ${v.toBinaryString}")
+              //println(s"Read ${v.toBinaryString}")
               val entry = table.read(v)
-              println(s"Found entry: $entry")
+              //println(s"${char(entry.symbol)} Found entry: $entry")
 
               ignore(entry.numberOfBits) ~> provide(entry.symbol)
             }(_ => ???)
@@ -308,10 +308,13 @@ object Zstd {
       val offsetTable = header.offsetTable.toTable
 
       println("Litlen")
+      println(header.litLengthTable.histogram)
       println(litLenTable)
       println("MatchLen")
+      println(header.matchLengthTable.histogram)
       println(matchLenTable)
       println("Offset")
+      println(header.offsetTable.histogram)
       println(offsetTable)
 
       reversed {
@@ -390,6 +393,7 @@ object Zstd {
             case 2 => fseTableSpec
           }
         }
+        println(s"modes $lMode $oMode $mLMode")
 
         tableFor(lMode, DefaultLitLenTable) :: tableFor(oMode, DefaultOffsetTable) :: tableFor(mLMode, DefaultMatchLenTable)
     }
@@ -644,7 +648,7 @@ object Zstd {
 object ZstdTest extends App {
   val data = {
     //val fis = new FileInputStream("abc_times_100_with_middle_d.txt.zst")
-    val fis = new FileInputStream("jsondata.json.zst")
+    val fis = new FileInputStream("jsondata150middle.json.zst")
     val buffer = new Array[Byte](10000)
     val read = fis.read(buffer)
     require(read > 0)
@@ -656,6 +660,7 @@ object ZstdTest extends App {
   val res = Zstd.frame.decode(data.toBitVector)
   println(s"Result: $res")
   if (res.isFailure) println(s"Context: ${res.toEither.left.get.context}")
+  println(new String(res.require.value.block.asInstanceOf[Zstd.CompressedBlock].literals.data.toArray))
 }
 
 /*

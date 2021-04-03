@@ -555,6 +555,13 @@ object Zstd {
   def appendInput[T](byteVector: ByteVector)(inner: Codec[T]): Codec[T] =
     mapInputBits(_ ++ byteVector.toBitVector, _.dropRight(byteVector.length * 8))(inner)
 
+  def skipToNextBytes[T](inner: Codec[T]): Codec[T] = new Codec[T] {
+    override def decode(bits: BitVector): Attempt[DecodeResult[T]] =
+      inner.decode(bits).map(_.mapRemainder(bs => bs.drop(bs.size % 8)))
+    override def encode(value: T): Attempt[BitVector] = ???
+    override def sizeBound: SizeBound = inner.sizeBound
+  }
+
   def mapInputBits[T](bi: BitVector => BitVector)(inner: Codec[T]): Codec[T] = mapInputBits(bi, bi)(inner)
   def mapInputBits[T](forward: BitVector => BitVector, backward: BitVector => BitVector)(inner: Codec[T]): Codec[T] =
     new Codec[T] {
@@ -571,55 +578,57 @@ object Zstd {
   def uintLEBits(bits: Int): Codec[Int] = limitedSizeBits(bits, withReversedBits(uintL(bits)))
 
   lazy val fseTableSpec: Codec[FSETableSpec] = withReversedBits {
+    skipToNextBytes {
 
-    case class ReadState(accuracyLog: Int, remaining: Int, counts: Seq[Int]) {
-      def next: Codec[FSETableSpec] =
-        if (remaining <= 1) {
-          val res = FSETableSpec(accuracyLog, counts)
-          provide(res)
-        } else {
-          val threshold = java.lang.Integer.highestOneBit(remaining)
-          val max = (threshold << 1) - 1 - remaining
-          val bits = java.lang.Integer.numberOfTrailingZeros(threshold)
+      case class ReadState(accuracyLog: Int, remaining: Int, counts: Seq[Int]) {
+        def next: Codec[FSETableSpec] =
+          if (remaining <= 1) {
+            val res = FSETableSpec(accuracyLog, counts)
+            provide(res)
+          } else {
+            val threshold = java.lang.Integer.highestOneBit(remaining)
+            val max = (threshold << 1) - 1 - remaining
+            val bits = java.lang.Integer.numberOfTrailingZeros(threshold)
 
-          // use peek because we don't know yet if `bits` or `bits + 1` bits will be used
-          peek(uintLEBits(bits + 1)).consume { bitsRead =>
-            val low = bitsRead & (threshold - 1)
+            // use peek because we don't know yet if `bits` or `bits + 1` bits will be used
+            peek(uintLEBits(bits + 1)).consume { bitsRead =>
+              val low = bitsRead & (threshold - 1)
 
-            val (value, bitsUsed) =
-              if (low < max)
-                (low, bits)
-              else {
-                val v = if (bitsRead >= threshold) bitsRead - max else bitsRead
-                (v, bits + 1)
-              }
+              val (value, bitsUsed) =
+                if (low < max)
+                  (low, bits)
+                else {
+                  val v = if (bitsRead >= threshold) bitsRead - max else bitsRead
+                  (v, bits + 1)
+                }
 
-            val realCount = value - 1
-            val read = if (realCount == -1) 1 else realCount
-            //println(s"accuracyLog: $accuracyLog remaining: $remaining threshold: $threshold max: $max bitsRead: $bitsRead value: $value bitsUsed: $bitsUsed realCount: $realCount")
-            val nextState = ReadState(accuracyLog, remaining - read, counts :+ realCount)
+              val realCount = value - 1
+              val read = if (realCount == -1) 1 else realCount
+              //println(s"accuracyLog: $accuracyLog remaining: $remaining threshold: $threshold max: $max bitsRead: $bitsRead value: $value bitsUsed: $bitsUsed realCount: $realCount")
+              val nextState = ReadState(accuracyLog, remaining - read, counts :+ realCount)
 
-            ignore(bitsUsed) ~> (if (realCount == 0) nextState.afterZero else nextState.next)
+              ignore(bitsUsed) ~> (if (realCount == 0) nextState.afterZero else nextState.next)
+            }(_ => ???)
+          }
+
+        def afterZero: Codec[FSETableSpec] =
+          uintLEBits(2).consume { num =>
+            val repeatCounts = Vector.fill(num)(0)
+            val nextState = copy(counts = counts ++ repeatCounts)
+            if (num == 3) // next repeat
+              nextState.afterZero
+            else
+              nextState.next
           }(_ => ???)
-        }
+      }
 
-      def afterZero: Codec[FSETableSpec] =
-        uintLEBits(2).consume { num =>
-          val repeatCounts = Vector.fill(num)(0)
-          val nextState = copy(counts = counts ++ repeatCounts)
-          if (num == 3) // next repeat
-            nextState.afterZero
-          else
-            nextState.next
-        }(_ => ???)
+      uintLEBits(4).consume { log0 =>
+        val log = log0 + 5
+        val states = 1 << log
+
+        ReadState(log, states + 1, Vector.empty).next
+      }(_ => ???)
     }
-
-    uintLEBits(4).consume { log0 =>
-      val log = log0 + 5
-      val states = 1 << log
-
-      ReadState(log, states + 1, Vector.empty).next
-    }(_ => ???)
   }
 
   def peekPrintNextBits(num: Int, tag: String): Codec[Unit] =

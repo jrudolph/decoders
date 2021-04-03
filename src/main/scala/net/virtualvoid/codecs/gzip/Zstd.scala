@@ -133,7 +133,7 @@ object Zstd {
                   }(_ => ???)
                 case 2 =>
                   uint24L.consume { len =>
-                    val regenSize = (len & 0x3ff) << 4 + lenBits
+                    val regenSize = ((len & 0x3ff) << 4) + lenBits
                     val compSize = len >> 10
                     provide(regenSize) :: provide(compSize) :: provide(4)
                   }(_ => ???)

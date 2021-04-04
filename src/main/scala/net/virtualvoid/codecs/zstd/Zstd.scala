@@ -1,8 +1,8 @@
-package net.virtualvoid.codecs.gzip
+package net.virtualvoid.codecs.zstd
 
-import scodec.{ Attempt, Codec, DecodeResult, SizeBound }
 import scodec.bits.{ BitVector, ByteVector, HexStringSyntax }
 import scodec.codecs._
+import scodec.{ Attempt, Codec, DecodeResult, SizeBound }
 import shapeless._
 
 import java.io.FileInputStream

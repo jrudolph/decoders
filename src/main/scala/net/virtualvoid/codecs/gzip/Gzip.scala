@@ -10,6 +10,7 @@ import scodec._
 import scodec.bits._
 import scodec.codecs._
 
+import java.io.FileInputStream
 import scala.annotation.tailrec
 import scala.collection.mutable.ListBuffer
 
@@ -64,7 +65,8 @@ object Gzip {
     val distanceCodec = huffman(distanceCode)
 
     // FIXME: should run until EndOfBlock
-    lazy val codes: Codec[List[LiteralOrReference]] = new BuildListUntil(literalOrReference, _ == LiteralOrReference.EndOfBlock)
+    lazy val codes: Codec[List[LiteralOrReference]] =
+      new BuildListUntil(literalOrReference, _ == LiteralOrReference.EndOfBlock)
 
     lazy val literalOrReference: Codec[LiteralOrReference] =
       litlenCodec.consume[LiteralOrReference] {
@@ -94,6 +96,7 @@ object Gzip {
   def huffman[T](code: HuffmanCode[T]): Codec[T] =
     Codec(_ => ???, { bits =>
       val (t, rest) = code.decode(bits)
+      require(bits.size > rest.size, s"Code [$code] did make no progress after reading [$t]")
       Attempt.successful(DecodeResult(t, rest))
     })
 
@@ -115,7 +118,9 @@ object Gzip {
       def decodeOne(intermediate: U, remaining: BitVector): Attempt[DecodeResult[V]] =
         inner.decode(remaining) match {
           case Successful(DecodeResult(t, rest)) =>
+            require(remaining.sizeGreaterThan(rest.size), s"Didn't consume anything after reading [$t]")
             val nextIntermediate = foldOne(intermediate, t)
+            //println(s"t: $t cond: ${until(t)}")
             if (until(t)) {
               val finalResult = finish(nextIntermediate)
               Successful(DecodeResult(finalResult, rest))
@@ -368,8 +373,10 @@ object Gzip {
         override type U = ListBuffer[Int]
         override def init: U = new ListBuffer[Int]
         override def foldOne(result: ListBuffer[Int], next: Seq[Int]): ListBuffer[Int] = {
-          println(s"Got $next")
-          result ++= next
+          if (next.head >= 0)
+            result ++= next
+          else
+            result ++= Seq.fill(-next.head)(result.last) // copy previous element 3-6 times
         }
         override def continue(intermediate: ListBuffer[Int]): Boolean = intermediate.size < numLengthsToRead
         override def finish(u: ListBuffer[Int]): Seq[Int] = u.result()
@@ -387,6 +394,12 @@ object Gzip {
           println(s"Got extra $extra")
           Seq.fill(extra + offset)(0)
         }, _ => ???)
+      case CodeLengthSymbol.CopyPrevious =>
+        println(s"Got CopyPrevious")
+        uintR(2).xmap({ extra =>
+          println(s"Got extra $extra")
+          Seq(-extra - 3) // HACK: use negative number for copy previous
+        }, _ => ???)
     })(_ => ???)
   }
 }
@@ -394,12 +407,17 @@ object Gzip {
 object Test extends App {
   import Gzip._
 
-  val target = gzipFile
+  val data = {
+    //val fis = new FileInputStream("abc_times_100_with_middle_d.txt.zst")
+    val fis = new FileInputStream("jsondata30.json.9.gz")
+    val buffer = new Array[Byte](10000)
+    val read = fis.read(buffer)
+    require(read > 0)
+    ByteVector(buffer.take(read))
+  }
+  println(s"Read ${data.length} bytes of data")
 
-  HuffmanCode(FixedLitLenCodeLengths)
-  val bytes = hex"1f8b08001c69965b0003edc2411100000c02a0ac6aff0eabb1071ce9a2aaaafe7e0b45b92bb80b0000"
-  //val bytes = hex"1f8b08001c69965b04034b4c4a4e1c45a321301a02a321301a02a321301a02a321301a02a321301a02833b04000b45b92bb80b0000"
-  println(target.decode(bytes.bits))
+  println(Gzip.gzipFile.decode(data.bits))
 }
 trait HuffmanCode[T] {
   def decode(bits: BitVector): (T, BitVector)
@@ -434,15 +452,26 @@ object HuffmanCode {
           val (length, els) = remainingGroups.head
           val value = bits.take(length).toIndexedSeq.foldLeft(0)((r, b) => (r << 1) | (if (b) 1 else 0))
           els.find(_._1 == value) match {
-            case Some((_, t)) => t -> bits.drop(length)
-            case None         => find(remainingGroups.tail)
+            case Some((_, t)) =>
+              //println(s"Found [${t}] dropping $length bits, remaining size: ${bits.drop(length).size} bits")
+              t -> bits.drop(length)
+            case None => find(remainingGroups.tail)
           }
 
         }
+
+        //println(s"Trying to find code in ${bits.take(20).toBin}")
         find(mapping)
       }
 
-      override def toString: String = mapping.flatMap(m => m._2.map(e => (e._1, e._2, m._1))).map(e => s"${e._2} ${e._3} ${e._1.toBinaryString}").mkString("\n")
+      override def toString: String =
+        mapping.flatMap(m => m._2.map(e => (e._1, e._2, m._1))).map(e => f"${bin(e._1, e._3)}%-15s ${e._3}%2d => ${e._2}").mkString("\n")
+
+      private def bin(code: Int, len: Int): String = {
+        val res = code.toBinaryString
+        "0" * (len - res.size) + res
+      }
+
     }
   }
 }

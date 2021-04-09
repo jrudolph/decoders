@@ -1,5 +1,7 @@
 package net.virtualvoid.codecs.gzip
 
+import net.virtualvoid.codecs.Utils
+
 import scala.annotation.tailrec
 import net.virtualvoid.codecs.gzip.Gzip.BlockType.DynamicHuffman
 import net.virtualvoid.codecs.gzip.Gzip.BlockType.FixedHuffman
@@ -417,7 +419,38 @@ object Test extends App {
   }
   println(s"Read ${data.length} bytes of data")
 
-  println(Gzip.gzipFile.decode(data.bits))
+  Gzip.gzipFile.decode(data.bits) match {
+    case Attempt.Successful(DecodeResult(res @ (header, sequences), rem)) =>
+      println(s"Decoded into $res")
+
+      val numLiterals = sequences.count(_.isInstanceOf[LiteralOrReference.Literal])
+      val sizeBackrefs =
+        sequences.collect {
+          case LiteralOrReference.Reference(length, _) => length
+        }.sum
+
+      println(s"Literals: $numLiterals Backrefs: $sizeBackrefs")
+
+      val litHisto =
+        sequences
+          .collect {
+            case LiteralOrReference.Literal(byte) => byte
+          }
+          .groupBy(identity)
+          .view
+          .mapValues(_.size)
+          .toVector
+          .sortBy(-_._2)
+
+      println("Literal histogram:")
+      litHisto.foreach {
+        case (char, num) =>
+          println(f"${Utils.char(char)}%5s $num%5d (log2: ${java.lang.Integer.numberOfTrailingZeros(java.lang.Integer.highestOneBit(num)) + 1}%2d) ${num.toFloat / numLiterals * 100}%5.2f %%")
+      }
+
+    case Attempt.Failure(err) =>
+      println(s"Parsing failed: $err")
+  }
 }
 trait HuffmanCode[T] {
   def decode(bits: BitVector): (T, BitVector)

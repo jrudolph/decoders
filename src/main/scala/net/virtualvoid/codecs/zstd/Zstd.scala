@@ -1,5 +1,7 @@
 package net.virtualvoid.codecs.zstd
 
+import net.virtualvoid.codecs.Utils
+import net.virtualvoid.codecs.gzip.Gzip
 import scodec.bits.{ BitVector, ByteVector, HexStringSyntax }
 import scodec.codecs._
 import scodec.{ Attempt, Codec, DecodeResult, SizeBound }
@@ -10,15 +12,16 @@ import java.io.FileInputStream
 object Zstd {
   case class Frame(
       header: FrameHeader,
-      block:  Block // FIXME: multiple blocks
+      blocks: List[Block]
   )
 
   lazy val frame: Codec[Frame] =
-    (constant(hex"28B52FFD") ~> frameHeader :: block).as[Frame]
+    (constant(hex"28B52FFD") ~> frameHeader :: new Gzip.BuildListUntil[Block](block, _.blockHeader.lastBlock)).as[Frame]
 
   case class FrameHeader(
       headerDesc:       FrameHeaderDesc,
-      frameContentSize: Long
+      frameContentSize: Long,
+      windowSize:       Long
   )
 
   lazy val frameHeader: Codec[FrameHeader] = frameHeaderDesc.consume { desc =>
@@ -33,9 +36,22 @@ object Zstd {
 
     println(desc)
     //println(s"fcs_length: $frameContentSizeLength")
-    require(desc.singleSegment) // can skip window desc
+    val frameContentSize = {
+      if (frameContentSizeLength > 0)
+        ulongL(frameContentSizeLength * 8).xmap[Long](_ + fcsBase, _ - fcsBase)
+      else
+        provide(-1L)
+    }
+    lazy val windowSize: Codec[Long] =
+      uint8.xmap[Long](_.toLong /** FIXME: needs to be split into exponent / mantissa */ , _ => ???)
 
-    (provide(desc) :: ulongL(frameContentSizeLength * 8).xmap[Long](_ + fcsBase, _ - fcsBase)).as[FrameHeader]
+    if (desc.singleSegment)
+      (provide(desc) :: frameContentSize).xmap[FrameHeader]({
+        case desc :: fcs :: HNil => FrameHeader(desc, fcs, fcs)
+      }, _ => ???)
+    else
+      (provide(desc) :: frameContentSize :: windowSize).as[FrameHeader]
+
   }(_ => ???)
 
   case class FrameHeaderDesc(
@@ -149,7 +165,7 @@ object Zstd {
   case class HuffmanSpec(maxNumberOfBits: Int, weights: Seq[Int]) {
     lazy val maxWeight = weights.max
     override def toString: String = s"Huffman weights total: ${weights.sum} maxNumberOfBits: $maxNumberOfBits max: $maxWeight\n" + weights.zipWithIndex.collect {
-      case (weight, idx) if weight > 0 => f"$idx%2x ${char(idx)} weight $weight%2d bits ${maxNumberOfBits + 1 - weight} "
+      case (weight, idx) if weight > 0 => f"$idx%2x ${Utils.char(idx)} weight $weight%2d bits ${maxNumberOfBits + 1 - weight} "
     }.mkString("\n")
 
     def toTable: HuffmanTable = {
@@ -184,7 +200,7 @@ object Zstd {
     }
   }
   case class HuffmanEntry(symbol: Int, weight: Int, numberOfBits: Int, code: Int, shiftedCode: Int, mask: Int) {
-    def toString(maxNumberOfBits: Int): String = f"${binStringWithLeftZeros(code, numberOfBits)}%10s ${binStringWithLeftZeros(shiftedCode, maxNumberOfBits)} ${mask.toBinaryString} ${numberOfBits}%2d bits => ${char(symbol)}"
+    def toString(maxNumberOfBits: Int): String = f"${binStringWithLeftZeros(code, numberOfBits)}%10s ${binStringWithLeftZeros(shiftedCode, maxNumberOfBits)} ${mask.toBinaryString} ${numberOfBits}%2d bits => ${Utils.char(symbol)}"
   }
 
   case class HuffmanTable(maxNumberOfBits: Int, entries: Seq[HuffmanEntry]) {
@@ -203,13 +219,6 @@ object Zstd {
     val str = num.toBinaryString
     "0" * (numberOfBits - str.size) + str
   }
-  private def char(idx: Int): String =
-    idx match {
-      case 0xa         => "'\\n'"
-      case 0xd         => "'\\r'"
-      case x if x < 32 => " .  "
-      case x           => s" '${x.toChar.toString}'"
-    }
 
   def ifEnoughDataAvailable[T](inner: Codec[T]): Codec[Option[T]] =
     lookahead(inner.xmap[Unit](_ => (), _ => ???)).consume[Option[T]] { canRead =>
@@ -251,7 +260,7 @@ object Zstd {
   }
   def padding: Codec[Unit] =
     peek(uint8).consume { first =>
-      val padding = java.lang.Integer.numberOfLeadingZeros(first) - 24 + 1
+      val padding = java.lang.Integer.numberOfLeadingZeros(first) - 24 /* uint8 as 32bit int */ + 1
 
       ignore(padding)
     }(_ => ???)
@@ -641,7 +650,7 @@ object Zstd {
 object ZstdTest extends App {
   val data = {
     //val fis = new FileInputStream("abc_times_100_with_middle_d.txt.zst")
-    val fis = new FileInputStream("jsondata150middle.json.zst")
+    val fis = new FileInputStream("repeated.txt.19.zst")
     val buffer = new Array[Byte](10000)
     val read = fis.read(buffer)
     require(read > 0)
@@ -653,7 +662,8 @@ object ZstdTest extends App {
   val res = Zstd.frame.decode(data.toBitVector)
   println(s"Result: $res")
   if (res.isFailure) println(s"Context: ${res.toEither.left.get.context}")
-  println(new String(res.require.value.block.asInstanceOf[Zstd.CompressedBlock].literals.data.toArray))
+  else
+    println(new String(res.require.value.blocks.head.asInstanceOf[Zstd.CompressedBlock].literals.data.toArray))
 }
 
 /*
@@ -1007,4 +1017,84 @@ sequence 3 = (0 lit, offset 0 = Repeated_Offset2 = (seq 1) 3, 24 len)
 
 
 fe 49 cd f4
+ */
+
+/*
+Sequence(6,125,RepeatedOffset(1)),
+Sequence(2,127,RepeatedOffset(1)),
+Sequence(1,231,RepeatedOffset(1)),
+Sequence(38,23,RepeatedOffset(1)),
+Sequence(7,126,DirectOffset(2770)),
+Sequence(1,127,RepeatedOffset(1)),
+Sequence(1,230,RepeatedOffset(1)),
+Sequence(40,23,RepeatedOffset(1)),
+Sequence(4,127,RepeatedOffset(2)),
+Sequence(2,127,RepeatedOffset(1)),
+Sequence(1,230,RepeatedOffset(1)),
+Sequence(40,23,RepeatedOffset(1)),
+Sequence(6,125,RepeatedOffset(2)),
+Sequence(2,127,RepeatedOffset(1)),
+Sequence(1,230,RepeatedOffset(1)),
+Sequence(40,23,RepeatedOffset(1)),
+Sequence(5,126,DirectOffset(4432)),
+Sequence(2,126,RepeatedOffset(1)),
+Sequence(2,230,RepeatedOffset(1)),
+Sequence(40,23,RepeatedOffset(1)),
+Sequence(6,130,DirectOffset(6112)),
+Sequence(8,126,RepeatedOffset(1)),
+Sequence(2,230,RepeatedOffset(1)),
+Sequence(40,23,RepeatedOffset(1)),
+Sequence(6,47,RepeatedOffset(1)),
+Sequence(1,48,RepeatedOffset(1)),
+Sequence(1,29,RepeatedOffset(1)),
+Sequence(8,113,RepeatedOffset(1)),
+Sequence(1,12,RepeatedOffset(1)),
+Sequence(2,230,RepeatedOffset(1)),
+Sequence(40,23,RepeatedOffset(1)),
+Sequence(6,125,RepeatedOffset(1)),
+Sequence(2,126,RepeatedOffset(1)),
+Sequence(2,53,RepeatedOffset(1)),
+177 Sequence(1,176,RepeatedOffset(1)),
+ 62 Sequence(40,22,RepeatedOffset(1)),
+ 48 Sequence(7,41,RepeatedOffset(1)),
+ 30 Sequence(7,23,RepeatedOffset(1)),
+ 29 Sequence(0,29,DirectOffset(49)),
+ 23 Sequence(0,23,RepeatedOffset(1)),
+ 60 Sequence(4,56,RepeatedOffset(1)),
+ 44 Sequence(21,23,DirectOffset(562)),
+ 23 Sequence(0,23,DirectOffset(152)),
+ 12 Sequence(0,12,RepeatedOffset(1)),
+232 Sequence(1,231,RepeatedOffset(1)),
+ 62 Sequence(39,23,RepeatedOffset(1)),
+ 52 Sequence(5,47,RepeatedOffset(1)),
+ 49 Sequence(2,47,RepeatedOffset(1)),
+ 28 Sequence(2,26,RepeatedOffset(1)),
+124 Sequence(4,120,RepeatedOffset(1)),
+ 15 Sequence(2,13,RepeatedOffset(1)),
+233 Sequence(1,232,RepeatedOffset(1)),
+ 60 Sequence(38,22,RepeatedOffset(1)),
+132 Sequence(6,126,DirectOffset(561)),
+136 Sequence(1,135,RepeatedOffset(1)),
+232 Sequence(1,231,RepeatedOffset(1)),
+ 61 Sequence(39,22,RepeatedOffset(1)),
+ 54 Sequence(7,47,RepeatedOffset(2)),
+ 49 Sequence(1,48,RepeatedOffset(1)),
+ 27 Sequence(1,26,RepeatedOffset(1)),
+125 Sequence(4,121,RepeatedOffset(1)),
+ 14 Sequence(1,13,RepeatedOffset(1)),
+232 Sequence(1,231,RepeatedOffset(1)),
+ 61 Sequence(39,22,RepeatedOffset(1)),
+ 53 Sequence(7,46,RepeatedOffset(1)),
+ 49 Sequence(2,47,RepeatedOffset(1)),
+ 29 Sequence(2,27,RepeatedOffset(1)),
+123 Sequence(3,120,RepeatedOffset(1)),
+ 15 Sequence(2,13,RepeatedOffset(1)),
+233 Sequence(1,232,RepeatedOffset(1)),
+ 60 Sequence(38,22,RepeatedOffset(1)),
+ 54 Sequence(7,47,RepeatedOffset(1)),
+ 49 Sequence(1,48,RepeatedOffset(1)),
+ 27 Sequence(1,26,RepeatedOffset(1)),
+ 75 Sequence(4,71,RepeatedOffset(1)),
+ 49 Sequence(5,44,RepeatedOffset(2)),
+ 14 Sequence(1,13,RepeatedOffset(1))))))
  */ 

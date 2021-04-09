@@ -1,6 +1,7 @@
 package net.virtualvoid.codecs.zstd
 
 import net.virtualvoid.codecs.Utils
+import Utils._
 import net.virtualvoid.codecs.gzip.Gzip
 import scodec.bits.{ BitVector, ByteVector, HexStringSyntax }
 import scodec.codecs._
@@ -28,7 +29,7 @@ object Zstd {
       windowSize:       Long
   )
 
-  lazy val frameHeader: Codec[FrameHeader] = constant(hex"28B52FFD") ~> frameHeaderDesc.consume { desc =>
+  lazy val frameHeader: Codec[FrameHeader] = constant(hex"28B52FFD") ~> frameHeaderDesc.flatMapD { desc =>
     val frameContentSizeLength = desc.frameContentSizeFlag match {
       case 0 if desc.singleSegment => 1
       case 0                       => 0
@@ -38,7 +39,7 @@ object Zstd {
     }
     val fcsBase = if (frameContentSizeLength == 2) 256 else 0
 
-    println(desc)
+    //println(desc)
     //println(s"fcs_length: $frameContentSizeLength")
     val frameContentSize = {
       if (frameContentSizeLength > 0)
@@ -56,7 +57,7 @@ object Zstd {
     else
       (provide(desc) :: frameContentSize :: windowSize).as[FrameHeader]
 
-  }(_ => ???)
+  }
 
   case class FrameHeaderDesc(
       frameContentSizeFlag: Int,
@@ -98,10 +99,10 @@ object Zstd {
   )
 
   lazy val block: Codec[Block] =
-    blockHeader.consume { header =>
+    blockHeader.flatMapD { header =>
       require(header.blockType == 2) // compressed block
       variableSizeBytes(provide(header.blockSize), compressedBlock(header).widen[Block](b => b, _ => ???))
-    }(_ => ???)
+    }
 
   case class BlockHeader(
       lastBlock: Boolean,
@@ -109,12 +110,17 @@ object Zstd {
       blockSize: Int
   )
   lazy val blockHeader: Codec[BlockHeader] =
-    uint24L.xmap[BlockHeader]({ i =>
-      val last = (i & 1) != 0
-      val blockType = (i & 6) >> 1
-      val blockSize = i >> 3
-      BlockHeader(last, blockType, blockSize)
-    }, _ => ???)
+    variableSizeBytes(
+      provide(3),
+      reversed { // weird little endian bit order
+        withReversedBits {
+          (uint(21) :: uint(2) :: bool).mapD[BlockHeader] {
+            case size :: tpe :: last :: HNil =>
+              BlockHeader(last, tpe, size)
+          }
+        }
+      }
+    )
 
   def compressedBlock(header: BlockHeader): Codec[CompressedBlock] = {
     require(header.blockType == 2) // compressed block
@@ -131,7 +137,7 @@ object Zstd {
 
   lazy val literalSpec: Codec[LiteralSpec] = {
     // FIXME: hard to decode because of weird bit order
-    (uint4 :: uint2 :: uint2).consume {
+    (uint4 :: uint2 :: uint2).flatMapD {
       case lenBits :: sizeFormat :: tpe :: HNil =>
         //require(tpe == 0, s"Literal type == $tpe but only 0 supported") // raw, FIXME: support more
         tpe match {
@@ -145,25 +151,25 @@ object Zstd {
             def sizes(sizeFormat: Int): Codec[Int :: Int :: Int :: HNil] =
               sizeFormat match {
                 case 1 =>
-                  uint16L.consume { len =>
+                  uint16L.flatMapD { len =>
                     val regenSize = ((len & 0x3f) << 4) + lenBits
                     val compSize = len >> 6
                     //println(s"lenBits: ${lenBits.toHexString} len: ${len.toHexString} regenSize: $regenSize compSize: $compSize ${(len & 0x3f).toHexString}")
                     provide(regenSize) :: provide(compSize) :: provide(4)
-                  }(_ => ???)
+                  }
                 case 2 =>
-                  uint24L.consume { len =>
+                  uint24L.flatMapD { len =>
                     val regenSize = ((len & 0x3ff) << 4) + lenBits
                     val compSize = len >> 10
                     provide(regenSize) :: provide(compSize) :: provide(4)
-                  }(_ => ???)
+                  }
               }
 
             //println("got here")
 
             (provide(tpe) :: sizes(sizeFormat)).as[LiteralSpec]
         }
-    }(_ => ???)
+    }
   }
 
   case class HuffmanSpec(maxNumberOfBits: Int, weights: Seq[Int]) {
@@ -225,13 +231,12 @@ object Zstd {
   }
 
   def ifEnoughDataAvailable[T](inner: Codec[T]): Codec[Option[T]] =
-    lookahead(inner.xmap[Unit](_ => (), _ => ???)).consume[Option[T]] { canRead =>
-      if (canRead) inner.xmap[Option[T]](Some(_), _ => ???)
-      else provide(None)
-    }(_ => ???)
+    lookahead(inner.mapD[Unit](_ => ())).flatMapD[Option[T]] { canRead =>
+      conditional(canRead, inner)
+    }
 
   lazy val huffmanSpec: Codec[HuffmanSpec] = {
-    fseTableSpec.consume { tableSpec =>
+    fseTableSpec.flatMapD { tableSpec =>
       val table = tableSpec.toTable
       println(s"Huffman table weights FSE: $table")
       def nextValues(state1: Int, state2: Int, current: Seq[Int]): Codec[HuffmanSpec] = {
@@ -239,43 +244,43 @@ object Zstd {
         val v2Entry = table.entries(state2)
         println(s"Read entries ${v1Entry.symbol} ${v2Entry.symbol}")
 
-        ifEnoughDataAvailable(readExtra(v1Entry.nbBits) :: readExtra(v2Entry.nbBits)).consume {
+        ifEnoughDataAvailable(readExtra(v1Entry.nbBits) :: readExtra(v2Entry.nbBits)).flatMapD {
           case Some(newState1 :: newState2 :: HNil) =>
             nextValues(newState1 + v1Entry.offset, newState2 + v2Entry.offset, current ++ Seq(v1Entry.symbol, v2Entry.symbol))
           case None =>
-            ifEnoughDataAvailable(readExtra(v1Entry.nbBits)).consume {
+            ifEnoughDataAvailable(readExtra(v1Entry.nbBits)).flatMapD {
               case Some(newState1) =>
                 provide(HuffmanSpec(current ++ Seq(v1Entry.symbol, v2Entry.symbol, table.entries(newState1).symbol)))
               case None => provide(HuffmanSpec(current ++ Seq(v1Entry.symbol, v2Entry.symbol)))
-            }(_ => ???)
-        }(_ => ???)
+            }
+        }
       }
 
       reversed {
         withReversedBits {
-          (padding ~> uint(tableSpec.accuracyLog) :: uint(tableSpec.accuracyLog)).consume {
+          (padding ~> uint(tableSpec.accuracyLog) :: uint(tableSpec.accuracyLog)).flatMapD {
             case state1 :: state2 :: HNil =>
               println(s"Start states state1: $state1 state2: $state2")
               nextValues(state1, state2, Nil)
-          }(_ => ???)
+          }
         }
       }
-    }(_ => ???)
+    }
   }
   def padding: Codec[Unit] =
-    peek(uint8).consume { first =>
+    peek(uint8).flatMapD { first =>
       val padding = java.lang.Integer.numberOfLeadingZeros(first) - 24 /* uint8 as 32bit int */ + 1
 
       ignore(padding)
-    }(_ => ???)
+    }
 
   def compressedLiterals(spec: LiteralSpec): Codec[ByteVector] =
-    variableSizeBytes(uint8, huffmanSpec).consume { huffmanSpec =>
+    variableSizeBytes(uint8, huffmanSpec).flatMapD { huffmanSpec =>
       println(s"Lit Spec: $spec Huffman Spec: $huffmanSpec")
       println(huffmanSpec.toTable)
 
       if (spec.numStreams == 4)
-        (uint16L :: uint16L :: uint16L).consume {
+        (uint16L :: uint16L :: uint16L).flatMapD {
           case stream1 :: stream2 :: stream3 :: HNil =>
             val numEls = (spec.regeneratedSize + 3) / 4
             val remaining = spec.regeneratedSize - 3 * numEls
@@ -283,13 +288,13 @@ object Zstd {
             (variableSizeBytes(provide(stream1), decodeLiterals(huffmanSpec, numEls)) ::
               variableSizeBytes(provide(stream2), decodeLiterals(huffmanSpec, numEls)) ::
               variableSizeBytes(provide(stream3), decodeLiterals(huffmanSpec, numEls)) ::
-              decodeLiterals(huffmanSpec, remaining)).xmap[ByteVector]({
+              decodeLiterals(huffmanSpec, remaining)).mapD[ByteVector] {
                 case s1 :: s2 :: s3 :: s4 :: HNil => s1 ++ s2 ++ s3 ++ s4
-              }, _ => ???)
-        }(_ => ???)
+              }
+        }
       else
         decodeLiterals(huffmanSpec, spec.regeneratedSize)
-    }(_ => ???)
+    }
 
   def decodeLiterals(huffmanSpec: HuffmanSpec, numElements: Int): Codec[ByteVector] = {
     val table = huffmanSpec.toTable
@@ -298,15 +303,15 @@ object Zstd {
       withReversedBits {
         appendInput(ByteVector(0)) {
           def readOne: Codec[Int] =
-            peek(uint(table.maxNumberOfBits)).consume { v =>
+            peek(uint(table.maxNumberOfBits)).flatMapD { v =>
               //println(s"Read ${v.toBinaryString}")
               val entry = table.read(v)
               //println(s"${char(entry.symbol)} Found entry: $entry")
 
               ignore(entry.numberOfBits) ~> provide(entry.symbol)
-            }(_ => ???)
+            }
 
-          padding ~> vectorOfN(provide(numElements), readOne).xmap[ByteVector](bs => ByteVector(bs: _*), _ => ???)
+          padding ~> vectorOfN(provide(numElements), readOne).mapD[ByteVector](bs => ByteVector(bs: _*))
         }
       }
     }
@@ -315,7 +320,7 @@ object Zstd {
   def readExtra(bits: Int): Codec[Int] = if (bits == 0) provide(0) else uint(bits)
 
   lazy val sequences: Codec[Sequences] =
-    sequenceSectionHeader.consume { header =>
+    sequenceSectionHeader.flatMapD { header =>
       val litLenTable = header.litLengthTable.toTable
       val matchLenTable = header.matchLengthTable.toTable
       val offsetTable = header.offsetTable.toTable
@@ -332,7 +337,7 @@ object Zstd {
 
       reversed {
         withReversedBits {
-          (padding ~> uint(header.litLengthTable.accuracyLog) :: uint(header.offsetTable.accuracyLog) :: uint(header.matchLengthTable.accuracyLog)).consume {
+          (padding ~> uint(header.litLengthTable.accuracyLog) :: uint(header.offsetTable.accuracyLog) :: uint(header.matchLengthTable.accuracyLog)).flatMapD {
             case litLenState :: offsetState :: matchLenState :: HNil =>
               println(litLenState, offsetState, matchLenState)
 
@@ -345,7 +350,7 @@ object Zstd {
                   println(s"Offset entry: $offsetEntry")
                   val offsetCode = offsetEntry.symbol
 
-                  readExtra(offsetCode).consume { extra =>
+                  readExtra(offsetCode).flatMapD { extra =>
                     val offsetValue = (1 << offsetCode) + extra
                     val offset =
                       if (offsetValue > 3) DirectOffset(offsetValue - 3)
@@ -355,37 +360,36 @@ object Zstd {
 
                     val matchLenEntry = matchLenTable.entries(matchLenState)
                     val matchLenCode = MatchLenCodes(matchLenEntry.symbol)
-                    readExtra(matchLenCode.extraBits).consume { extra =>
+                    readExtra(matchLenCode.extraBits).flatMapD { extra =>
                       val matchLen = matchLenCode.baseline + extra
                       println(s"MatchLen: $matchLen")
 
                       val litLenEntry = litLenTable.entries(litLenState)
                       val litLenCode = LitLenCodes(litLenEntry.symbol)
 
-                      readExtra(litLenCode.extraBits).consume { extra =>
+                      readExtra(litLenCode.extraBits).flatMapD { extra =>
                         val litLen = litLenCode.baseline + extra
                         println(s"LitLen: $litLen")
 
                         val allSeqs: Vector[Sequence] = current :+ Sequence(litLen, matchLen, offset)
                         if (remaining > 1)
                           // state update: `Literals_Length_State` is updated, followed by `Match_Length_State`, and then `Offset_State`
-                          (readExtra(litLenEntry.nbBits) :: readExtra(matchLenEntry.nbBits) :: readExtra(offsetEntry.nbBits)).consume {
+                          (readExtra(litLenEntry.nbBits) :: readExtra(matchLenEntry.nbBits) :: readExtra(offsetEntry.nbBits)).flatMapD {
                             case ll :: ml :: o :: HNil =>
                               nextSequence(remaining - 1, ll + litLenEntry.offset, o + offsetEntry.offset, ml + matchLenEntry.offset, allSeqs)
-                          }(_ => ???)
+                          }
                         else provide(allSeqs: Seq[Sequence])
 
-                      }(_ => ???)
-                    }(_ => ???)
-
-                  }(_ => ???)
+                      }
+                    }
+                  }
                 }
 
               (provide(header) :: nextSequence(header.numberOfSequences, litLenState, offsetState, matchLenState, Vector.empty)).as[Sequences]
-          }(_ => ???)
+          }
         }
       }
-    }(_ => ???)
+    }
 
   case class SequenceSectionHeader(
       numberOfSequences: Int,
@@ -413,16 +417,16 @@ object Zstd {
       .as[SequenceSectionHeader]
 
   lazy val numberOfSequences: Codec[Int] =
-    uint8.consume[Int] {
+    uint8.flatMapD[Int] {
       case 0            => provide(0)
       case x if x < 128 => provide(x)
       case x if x < 255 =>
         // ((byte0-128) << 8) + byte1
-        uint8.xmap(byte1 => ((x - 128) << 8) + byte1, _ => ???)
+        uint8.mapD(byte1 => ((x - 128) << 8) + byte1)
       case 255 =>
         // byte1 + (byte2<<8) + 0x7F00
-        uint16L.xmap(_ + 0x7f00, _ => ???)
-    }(_ => ???)
+        uint16L.mapD(_ + 0x7f00)
+    }
 
   case class FSETableSpec(
       accuracyLog: Int,
@@ -601,7 +605,7 @@ object Zstd {
             val bits = java.lang.Integer.numberOfTrailingZeros(threshold)
 
             // use peek because we don't know yet if `bits` or `bits + 1` bits will be used
-            peek(uintLEBits(bits + 1)).consume { bitsRead =>
+            peek(uintLEBits(bits + 1)).flatMapD { bitsRead =>
               val low = bitsRead & (threshold - 1)
 
               val (value, bitsUsed) =
@@ -618,43 +622,43 @@ object Zstd {
               val nextState = ReadState(accuracyLog, remaining - read, counts :+ realCount)
 
               ignore(bitsUsed) ~> (if (realCount == 0) nextState.afterZero else nextState.next)
-            }(_ => ???)
+            }
           }
 
         def afterZero: Codec[FSETableSpec] =
-          uintLEBits(2).consume { num =>
+          uintLEBits(2).flatMapD { num =>
             val repeatCounts = Vector.fill(num)(0)
             val nextState = copy(counts = counts ++ repeatCounts)
             if (num == 3) // next repeat
               nextState.afterZero
             else
               nextState.next
-          }(_ => ???)
+          }
       }
 
-      uintLEBits(4).consume { log0 =>
+      uintLEBits(4).flatMapD { log0 =>
         val log = log0 + 5
         val states = 1 << log
 
         ReadState(log, states + 1, Vector.empty).next
-      }(_ => ???)
+      }
     }
   }
 
   def peekPrintNextBits(num: Int, tag: String): Codec[Unit] =
-    peek(bits(num)).xmap({ bv => println(s"$tag: ${bv.toBin}") }, _ => ???)
+    peek(bits(num)).mapD { bv => println(s"$tag: ${bv.toBin}") }
 
   def peekPrintNextBytes(num: Int, tag: String): Codec[Unit] =
-    peek(bytes(num)).xmap({ bv => println(s"$tag: ${bv.toHex}") }, _ => ???)
+    peek(bytes(num)).mapD { bv => println(s"$tag: ${bv.toHex}") }
 
   def peekRemainingBytes(tag: String): Codec[Unit] =
-    peek(bytes.xmap({ bv => println(s"$tag: ${bv.size} bytes ${bv.toHex}") }, _ => ???))
+    peek(bytes.mapD { bv => println(s"$tag: ${bv.size} bytes ${bv.toHex}") })
 }
 
 object ZstdTest extends App {
   val data = {
-    //val fis = new FileInputStream("abc_times_100_with_middle_d.txt.zst")
-    val fis = new FileInputStream("repeated.txt.19.zst")
+    val fis = new FileInputStream("abc_times_100_with_middle_d.txt.zst")
+    //val fis = new FileInputStream("repeated.txt.19.zst")
     val buffer = new Array[Byte](10000)
     val read = fis.read(buffer)
     require(read > 0)
@@ -871,16 +875,16 @@ ec 4f 22 2b 88
 
 0000 001   <- padding
 0 0010 101 <- '{'
-1 100 <- '"'
-1 111 <- 'e'
-0 1001 1 <- 'n'
-10111 <- 't'
-10110 <- 'r'
-0 0100 11 <- 'y'
-11 00 <- '"'
-10 001 <- ':'
+1 100      <- '"'
+1 111      <- 'e'
+0 1001 1   <- 'n'
+10111      <- 't'
+10110      <- 'r'
+0 0100 11  <- 'y'
+11 00      <- '"'
+10 001     <- ':'
 0 0010 101 <- '{'
-1 100 <- '"'
+1 100      <- '"'
 0 1000
 
 0010011

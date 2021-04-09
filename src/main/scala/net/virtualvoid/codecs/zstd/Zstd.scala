@@ -237,7 +237,7 @@ object Zstd {
 
   lazy val huffmanSpec: Codec[HuffmanSpec] = {
     fseTableSpec.flatMapD { tableSpec =>
-      val table = tableSpec.toTable
+      val table = tableSpec.toTable((0 to 20).map(provide))
       println(s"Huffman table weights FSE: $table")
       def nextValues(state1: Int, state2: Int, current: Seq[Int]): Codec[HuffmanSpec] = {
         val v1Entry = table.entries(state1)
@@ -321,9 +321,9 @@ object Zstd {
 
   lazy val sequences: Codec[Sequences] =
     sequenceSectionHeader.flatMapD { header =>
-      val litLenTable = header.litLengthTable.toTable
-      val matchLenTable = header.matchLengthTable.toTable
-      val offsetTable = header.offsetTable.toTable
+      val litLenTable = header.litLengthTable.toTable(LitLenCodes)
+      val matchLenTable = header.matchLengthTable.toTable(MatchLenCodes)
+      val offsetTable = header.offsetTable.toTable(OffsetCodes)
 
       println("Litlen")
       println(header.litLengthTable.histogram)
@@ -346,28 +346,13 @@ object Zstd {
                 else {
                   // offset, matchlen, lit
                   val offsetEntry = offsetTable.entries(offsetState)
-                  println(s"Offset entry: $offsetEntry")
-                  val offsetCode = offsetEntry.symbol
-
                   val matchLenEntry = matchLenTable.entries(matchLenState)
-                  val matchLenCode = MatchLenCodes(matchLenEntry.symbol)
-
                   val litLenEntry = litLenTable.entries(litLenState)
-                  val litLenCode = LitLenCodes(litLenEntry.symbol)
 
-                  (readExtra(offsetCode) :: readExtra(matchLenCode.extraBits) :: readExtra(litLenCode.extraBits)).flatMapD {
-                    case offsetExtra :: matchLenExtra :: litLenExtra :: HNil =>
-                      val offsetValue = (1 << offsetCode) + offsetExtra
-                      val offset =
-                        if (offsetValue > 3) DirectOffset(offsetValue - 3)
-                        else RepeatedOffset(offsetValue)
-
+                  (offsetEntry.decodeSymbol :: matchLenEntry.decodeSymbol :: litLenEntry.decodeSymbol).flatMapD {
+                    case offset :: matchLen :: litLen :: HNil =>
                       println(s"Offset: $offset")
-
-                      val matchLen = matchLenCode.baseline + matchLenExtra
                       println(s"MatchLen: $matchLen")
-
-                      val litLen = litLenCode.baseline + litLenExtra
                       println(s"LitLen: $litLen")
 
                       val allSeqs: Vector[Sequence] = current :+ Sequence(litLen, matchLen, offset)
@@ -426,25 +411,25 @@ object Zstd {
 
   case class FSETableSpec(
       accuracyLog: Int,
-      histogram:   Seq[Int]
+      histogram:   Seq[Int],
   ) {
-    def toTable: FSETable[Int] = {
+    def toTable[T](symbols:     Seq[Codec[T]]): FSETable[T] = {
       val size = 1 << accuracyLog
       val mask = size - 1
       val skip = (size >> 1) + (size >> 3) + 3
       val minMinus1 = size - histogram.count(_ == -1)
-      val buffer = new Array[FSETableEntry[Int]](size)
+      val buffer = new Array[FSETableEntry[T]](size)
 
       var lastIdx = size - 1
       histogram.zipWithIndex.filter(_._1 == -1).foreach {
         case (_ /* -1 */ , symbol) =>
           require(buffer(lastIdx) == null)
-          buffer(lastIdx) = FSETableEntry(symbol, accuracyLog, 0)
+          buffer(lastIdx) = FSETableEntry(symbol, symbols(symbol), accuracyLog, 0)
           lastIdx -= 1
       }
 
       var pos = 0
-      def allocate(entry: FSETableEntry[Int]): Unit = {
+      def allocate(entry: FSETableEntry[T]): Unit = {
         buffer(pos) = entry
         do {
           pos = (pos + skip) & mask
@@ -454,7 +439,7 @@ object Zstd {
       histogram.zipWithIndex.foreach {
         case (count, symbol) =>
           if (count > 0) {
-            val e = FSETableEntry(symbol, -1, -1) // bits and offset to be filled later
+            val e = FSETableEntry(symbol, symbols(symbol), -1, -1) // bits and offset to be filled later
             (0 until count).foreach { _ => allocate(e) }
 
             val nextPower =
@@ -469,12 +454,12 @@ object Zstd {
 
             val doubleStartOffset = (count - double) * width
             buffer.zipWithIndex.filter(e => e._1 != null && e._1.symbol == symbol).zipWithIndex.foreach {
-              case ((_, idx), num) =>
+              case ((s, idx), num) =>
                 val newEntry =
                   if (num < double) // double entry
-                    FSETableEntry(symbol, bits + 1, doubleStartOffset + 2 * width * num)
+                    s.copy(nbBits = bits + 1, offset = doubleStartOffset + 2 * width * num)
                   else // single entry
-                    FSETableEntry(symbol, bits, width * (num - double))
+                    s.copy(nbBits = bits, offset = width * (num - double))
 
                 buffer(idx) = newEntry
             }
@@ -485,15 +470,16 @@ object Zstd {
     }
   }
   case class FSETableEntry[T](
-      symbol: T,
-      nbBits: Int,
-      offset: Int
+      symbol:       Int,
+      decodeSymbol: Codec[T],
+      nbBits:       Int,
+      offset:       Int
   )
   case class FSETable[T](entries: IndexedSeq[FSETableEntry[T]]) {
     override def toString: String =
       entries.zipWithIndex.map {
         case (null, state) => f"$state%4d null"
-        case (FSETableEntry(symbol, nbBits, offset), state) =>
+        case (FSETableEntry(symbol, codec, nbBits, offset), state) =>
           f"$state%4d $nbBits%2d bits at $offset%4d => $symbol"
       }.mkString("\n")
   }
@@ -529,12 +515,25 @@ object Zstd {
   | `Number_of_Bits`    |  12  |  13  |  14  |  15  |  16  |
    */
 
-  case class MatchLenCode(baseline: Int, extraBits: Int)
-  lazy val MatchLenCodes: IndexedSeq[MatchLenCode] =
+  lazy val OffsetCodes: IndexedSeq[Codec[Offset]] =
+    (0 to 31).map { offsetCode =>
+      readExtra(offsetCode).mapD { offsetExtra =>
+        val offsetValue = (1 << offsetCode) + offsetExtra
+
+          if (offsetValue > 3) DirectOffset(offsetValue - 3)
+          else RepeatedOffset(offsetValue)
+      }
+    }
+
+  lazy val MatchLenCodes: IndexedSeq[Codec[Int]] = {
+    case class MatchLenCode(baseline: Int, extraBits: Int)
+
     (Vector.fill(31)(0) ++ Vector(1, 1, 1, 1, 2, 2, 3, 3, 4, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16))
       .scanLeft(MatchLenCode(3, 0)) { (code, nextBits) =>
         MatchLenCode(code.baseline + (1 << code.extraBits), nextBits)
       }
+      .map(c => readExtra(c.extraBits).mapD(_ + c.baseline))
+  }
 
   /*
   | `Literals_Length_Code` |         0-15           |
@@ -557,12 +556,16 @@ object Zstd {
   | `Baseline`             | 8192 |16384 |32768 |65536 |
   | `Number_of_Bits`       |  13  |  14  |  15  |  16  |
    */
-  case class LitLenCode(baseline: Int, extraBits: Int)
-  lazy val LitLenCodes: IndexedSeq[LitLenCode] =
+
+  lazy val LitLenCodes: IndexedSeq[Codec[Int]] = {
+    case class LitLenCode(baseline: Int, extraBits: Int)
+
     (Vector.fill(15)(0) ++ Vector(1, 1, 1, 1, 2, 2, 3, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16))
       .scanLeft(LitLenCode(0, 0)) { (code, nextBits) =>
         LitLenCode(code.baseline + (1 << code.extraBits), nextBits)
       }
+      .map(c => readExtra(c.extraBits).mapD(_ + c.baseline))
+  }
 
   /**
    * Reverses bits while running inner codec
@@ -1101,4 +1104,4 @@ Sequence(2,53,RepeatedOffset(1)),
  75 Sequence(4,71,RepeatedOffset(1)),
  49 Sequence(5,44,RepeatedOffset(2)),
  14 Sequence(1,13,RepeatedOffset(1))))))
- */ 
+ */

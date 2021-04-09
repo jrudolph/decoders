@@ -165,8 +165,6 @@ object Zstd {
                   }
               }
 
-            //println("got here")
-
             (provide(tpe) :: sizes(sizeFormat)).as[LiteralSpec]
         }
     }

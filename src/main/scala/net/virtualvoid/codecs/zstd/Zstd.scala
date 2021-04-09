@@ -11,12 +11,16 @@ import java.io.FileInputStream
 
 object Zstd {
   case class Frame(
-      header: FrameHeader,
-      blocks: List[Block]
+      header:   FrameHeader,
+      blocks:   List[Block],
+      checksum: Option[Long]
   )
 
   lazy val frame: Codec[Frame] =
-    (frameHeader :: new Gzip.BuildListUntil[Block](block, _.blockHeader.lastBlock)).as[Frame]
+    frameHeader.flatPrepend { header =>
+      val checksum: Codec[Option[Long]] = conditional(header.headerDesc.contentChecksum, uint32)
+      new Gzip.BuildListUntil[Block](block, _.blockHeader.lastBlock) :: checksum
+    }.as[Frame]
 
   case class FrameHeader(
       headerDesc:       FrameHeaderDesc,

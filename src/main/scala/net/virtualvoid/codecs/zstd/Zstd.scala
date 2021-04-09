@@ -346,42 +346,38 @@ object Zstd {
                 else {
                   // offset, matchlen, lit
                   val offsetEntry = offsetTable.entries(offsetState)
-
                   println(s"Offset entry: $offsetEntry")
                   val offsetCode = offsetEntry.symbol
 
-                  readExtra(offsetCode).flatMapD { extra =>
-                    val offsetValue = (1 << offsetCode) + extra
-                    val offset =
-                      if (offsetValue > 3) DirectOffset(offsetValue - 3)
-                      else RepeatedOffset(offsetValue)
+                  val matchLenEntry = matchLenTable.entries(matchLenState)
+                  val matchLenCode = MatchLenCodes(matchLenEntry.symbol)
 
-                    println(s"Offset: $offset")
+                  val litLenEntry = litLenTable.entries(litLenState)
+                  val litLenCode = LitLenCodes(litLenEntry.symbol)
 
-                    val matchLenEntry = matchLenTable.entries(matchLenState)
-                    val matchLenCode = MatchLenCodes(matchLenEntry.symbol)
-                    readExtra(matchLenCode.extraBits).flatMapD { extra =>
-                      val matchLen = matchLenCode.baseline + extra
+                  (readExtra(offsetCode) :: readExtra(matchLenCode.extraBits) :: readExtra(litLenCode.extraBits)).flatMapD {
+                    case offsetExtra :: matchLenExtra :: litLenExtra :: HNil =>
+                      val offsetValue = (1 << offsetCode) + offsetExtra
+                      val offset =
+                        if (offsetValue > 3) DirectOffset(offsetValue - 3)
+                        else RepeatedOffset(offsetValue)
+
+                      println(s"Offset: $offset")
+
+                      val matchLen = matchLenCode.baseline + matchLenExtra
                       println(s"MatchLen: $matchLen")
 
-                      val litLenEntry = litLenTable.entries(litLenState)
-                      val litLenCode = LitLenCodes(litLenEntry.symbol)
+                      val litLen = litLenCode.baseline + litLenExtra
+                      println(s"LitLen: $litLen")
 
-                      readExtra(litLenCode.extraBits).flatMapD { extra =>
-                        val litLen = litLenCode.baseline + extra
-                        println(s"LitLen: $litLen")
-
-                        val allSeqs: Vector[Sequence] = current :+ Sequence(litLen, matchLen, offset)
-                        if (remaining > 1)
-                          // state update: `Literals_Length_State` is updated, followed by `Match_Length_State`, and then `Offset_State`
-                          (readExtra(litLenEntry.nbBits) :: readExtra(matchLenEntry.nbBits) :: readExtra(offsetEntry.nbBits)).flatMapD {
-                            case ll :: ml :: o :: HNil =>
-                              nextSequence(remaining - 1, ll + litLenEntry.offset, o + offsetEntry.offset, ml + matchLenEntry.offset, allSeqs)
-                          }
-                        else provide(allSeqs: Seq[Sequence])
-
-                      }
-                    }
+                      val allSeqs: Vector[Sequence] = current :+ Sequence(litLen, matchLen, offset)
+                      if (remaining > 1)
+                        // state update: `Literals_Length_State` is updated, followed by `Match_Length_State`, and then `Offset_State`
+                        (readExtra(litLenEntry.nbBits) :: readExtra(matchLenEntry.nbBits) :: readExtra(offsetEntry.nbBits)).flatMapD {
+                          case ll :: ml :: o :: HNil =>
+                            nextSequence(remaining - 1, ll + litLenEntry.offset, o + offsetEntry.offset, ml + matchLenEntry.offset, allSeqs)
+                        }
+                      else provide(allSeqs: Seq[Sequence])
                   }
                 }
 

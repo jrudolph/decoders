@@ -1,10 +1,10 @@
 val scalaV = "2.13.5"
 val scodecV = "1.11.7"
-val specs2V = "4.10.6"
+val scalatestV = "3.2.5"
 
 libraryDependencies ++= Seq(
   "org.scodec" %% "scodec-core" % scodecV,
-  "org.specs2" %% "specs2-core" % specs2V % "test"
+  "org.scalatest" %% "scalatest" % scalatestV % "test"
 )
 
 scalaVersion := scalaV

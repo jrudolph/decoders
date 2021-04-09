@@ -16,7 +16,7 @@ object Zstd {
   )
 
   lazy val frame: Codec[Frame] =
-    (constant(hex"28B52FFD") ~> frameHeader :: new Gzip.BuildListUntil[Block](block, _.blockHeader.lastBlock)).as[Frame]
+    (frameHeader :: new Gzip.BuildListUntil[Block](block, _.blockHeader.lastBlock)).as[Frame]
 
   case class FrameHeader(
       headerDesc:       FrameHeaderDesc,
@@ -24,7 +24,7 @@ object Zstd {
       windowSize:       Long
   )
 
-  lazy val frameHeader: Codec[FrameHeader] = frameHeaderDesc.consume { desc =>
+  lazy val frameHeader: Codec[FrameHeader] = constant(hex"28B52FFD") ~> frameHeaderDesc.consume { desc =>
     val frameContentSizeLength = desc.frameContentSizeFlag match {
       case 0 if desc.singleSegment => 1
       case 0                       => 0

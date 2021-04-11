@@ -173,7 +173,7 @@ object Zstd {
   case class HuffmanSpec(maxNumberOfBits: Int, weights: Seq[Int]) {
     lazy val maxWeight = weights.max
     override def toString: String = s"Huffman weights total: ${weights.sum} maxNumberOfBits: $maxNumberOfBits max: $maxWeight\n" + weights.zipWithIndex.collect {
-      case (weight, idx) if weight > 0 => f"$idx%2x ${Utils.char(idx)} weight $weight%2d bits ${maxNumberOfBits + 1 - weight} "
+      case (weight, idx) if weight > 0 => f"$idx%2x ${Utils.char(idx)} weight $weight%2d bits ${maxNumberOfBits + 1 - weight}%2d"
     }.mkString("\n")
 
     def toTable: HuffmanTable = {

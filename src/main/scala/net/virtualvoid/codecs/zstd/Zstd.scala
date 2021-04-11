@@ -593,13 +593,13 @@ object Zstd {
       override def sizeBound: SizeBound = inner.sizeBound
     }
 
-  /**
-   * Reads `bits` from a little endian bit stream and interprets them reversed
-   */
-  def uintLEBits(bits: Int): Codec[Int] = limitedSizeBits(bits, withReversedBits(uintL(bits)))
-
   lazy val fseTableSpec: Codec[FSETableSpec] = withReversedBits {
     byteAligned {
+      /**
+       * Reads `bits` from a little endian bit stream and interprets them reversed
+       */
+      def uintLEBits(bits: Int): Codec[Int] =
+        limitedSizeBits(bits, reversed(uint(bits)))
 
       case class ReadState(accuracyLog: Int, remaining: Int, counts: Seq[Int]) {
         def next: Codec[FSETableSpec] =

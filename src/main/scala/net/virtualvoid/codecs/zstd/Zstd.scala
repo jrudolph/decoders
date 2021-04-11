@@ -2,7 +2,6 @@ package net.virtualvoid.codecs.zstd
 
 import net.virtualvoid.codecs.Utils
 import net.virtualvoid.codecs.Utils._
-import net.virtualvoid.codecs.gzip.Gzip
 import scodec.bits.{ BitVector, ByteVector, HexStringSyntax }
 import scodec.codecs._
 import scodec.{ Attempt, Codec, DecodeResult, SizeBound }
@@ -13,14 +12,34 @@ import java.io.FileInputStream
 object Zstd {
   case class Frame(
       header:   FrameHeader,
-      blocks:   List[Block],
+      blocks:   Seq[Block],
       checksum: Option[Long]
   )
 
   lazy val frame: Codec[Frame] =
     frameHeader.flatPrepend { header =>
+      val blocks =
+        Utils.collectWithState[Block, BlockState](BlockState.initial) { state =>
+          block(state).flatZip { // FIXME: other cases
+            case nextBlock: CompressedBlock =>
+              provide {
+                if (nextBlock.blockHeader.lastBlock) None
+                else Some {
+                  val header = nextBlock.sequences.header
+                  BlockState(
+                    nextBlock.literals.huffmanSpec,
+                    if (header.litLengthMode == 2) Some(header.litLengthTable) else state.litLenTable,
+                    if (header.matchLengthMode == 2) Some(header.matchLengthTable) else state.matchLenTable,
+                    if (header.offsetMode == 2) Some(header.offsetTable) else state.offsetTable
+                  )
+                }
+              }
+          }
+        }
+
       val checksum: Codec[Option[Long]] = conditional(header.headerDesc.contentChecksum, uint32)
-      new Gzip.BuildListUntil[Block](block, _.blockHeader.lastBlock) :: checksum
+
+      blocks :: checksum
     }.as[Frame]
 
   case class FrameHeader(
@@ -84,8 +103,9 @@ object Zstd {
       numStreams:      Int
   )
   case class Literals(
-      spec: LiteralSpec,
-      data: ByteVector
+      spec:        LiteralSpec,
+      huffmanSpec: Option[HuffmanSpec],
+      data:        ByteVector
   )
 
   sealed trait Offset
@@ -98,10 +118,21 @@ object Zstd {
       sequences: Seq[Sequence]
   )
 
-  lazy val block: Codec[Block] =
+  /** State that needs to be maintained between blocks */
+  case class BlockState(
+      huffmanSpec:   Option[HuffmanSpec],
+      litLenTable:   Option[FSETableSpec],
+      matchLenTable: Option[FSETableSpec],
+      offsetTable:   Option[FSETableSpec]
+  )
+  object BlockState {
+    def initial: BlockState = BlockState(None, None, None, None)
+  }
+
+  def block(blockState: BlockState): Codec[Block] =
     blockHeader.flatMapD { header =>
       require(header.blockType == 2) // compressed block
-      variableSizeBytes(provide(header.blockSize), compressedBlock(header).widen[Block](b => b, _ => ???))
+      variableSizeBytes(provide(header.blockSize), compressedBlock(blockState, header).widen[Block](b => b, _ => ???))
     }
 
   case class BlockHeader(
@@ -122,15 +153,15 @@ object Zstd {
       }
     )
 
-  def compressedBlock(header: BlockHeader): Codec[CompressedBlock] = {
+  def compressedBlock(blockState: BlockState, header: BlockHeader): Codec[CompressedBlock] = {
     require(header.blockType == 2) // compressed block
-    (provide(header) :: literals :: sequences).as[CompressedBlock]
+    (provide(header) :: literals :: sequences(blockState)).as[CompressedBlock]
   }
 
   lazy val literals: Codec[Literals] =
-    literalSpec.flatZipHList { spec =>
+    literalSpec.flatPrepend { spec =>
       spec.literalsType match {
-        case 0 => bytes(spec.compressedSize)
+        case 0 => provide(None: Option[HuffmanSpec]) :: bytes(spec.compressedSize)
         case 2 => variableSizeBytes(provide(spec.compressedSize), compressedLiterals(spec))
       }
     }.as[Literals]
@@ -272,26 +303,28 @@ object Zstd {
       ignore(padding)
     }
 
-  def compressedLiterals(spec: LiteralSpec): Codec[ByteVector] =
+  def compressedLiterals(spec: LiteralSpec): Codec[Option[HuffmanSpec] :: ByteVector :: HNil] =
     variableSizeBytes(uint8, huffmanSpec).flatMapD { huffmanSpec =>
       println(s"Lit Spec: $spec Huffman Spec: $huffmanSpec")
       println(huffmanSpec.toTable)
 
-      if (spec.numStreams == 4)
-        (uint16L :: uint16L :: uint16L).flatMapD {
-          case stream1 :: stream2 :: stream3 :: HNil =>
-            val numEls = (spec.regeneratedSize + 3) / 4
-            val remaining = spec.regeneratedSize - 3 * numEls
+      provide(Some(huffmanSpec): Option[HuffmanSpec]) :: {
+        if (spec.numStreams == 4)
+          (uint16L :: uint16L :: uint16L).flatMapD {
+            case stream1 :: stream2 :: stream3 :: HNil =>
+              val numEls = (spec.regeneratedSize + 3) / 4
+              val remaining = spec.regeneratedSize - 3 * numEls
 
-            (variableSizeBytes(provide(stream1), decodeLiterals(huffmanSpec, numEls)) ::
-              variableSizeBytes(provide(stream2), decodeLiterals(huffmanSpec, numEls)) ::
-              variableSizeBytes(provide(stream3), decodeLiterals(huffmanSpec, numEls)) ::
-              decodeLiterals(huffmanSpec, remaining)).mapD[ByteVector] {
-                case s1 :: s2 :: s3 :: s4 :: HNil => s1 ++ s2 ++ s3 ++ s4
-              }
-        }
-      else
-        decodeLiterals(huffmanSpec, spec.regeneratedSize)
+              (variableSizeBytes(provide(stream1), decodeLiterals(huffmanSpec, numEls)) ::
+                variableSizeBytes(provide(stream2), decodeLiterals(huffmanSpec, numEls)) ::
+                variableSizeBytes(provide(stream3), decodeLiterals(huffmanSpec, numEls)) ::
+                decodeLiterals(huffmanSpec, remaining)).mapD[ByteVector] {
+                  case s1 :: s2 :: s3 :: s4 :: HNil => s1 ++ s2 ++ s3 ++ s4
+                }
+          }
+        else
+          decodeLiterals(huffmanSpec, spec.regeneratedSize)
+      }
     }
 
   def decodeLiterals(huffmanSpec: HuffmanSpec, numElements: Int): Codec[ByteVector] = {
@@ -317,8 +350,8 @@ object Zstd {
 
   def readExtra(bits: Int): Codec[Int] = if (bits == 0) provide(0) else uint(bits)
 
-  lazy val sequences: Codec[Sequences] =
-    sequenceSectionHeader.flatMapD { header =>
+  def sequences(blockState: BlockState): Codec[Sequences] =
+    sequenceSectionHeader(blockState).flatMapD { header =>
       val litLenTable = header.litLengthTable.toTable(LitLenCodeTable)
       val matchLenTable = header.matchLengthTable.toTable(MatchLenCodeTable)
       val offsetTable = header.offsetTable.toTable(OffsetCodeTable)
@@ -367,18 +400,19 @@ object Zstd {
       matchLengthTable:  FSETableSpec
   )
 
-  lazy val sequenceSectionHeader: Codec[SequenceSectionHeader] =
-    (numberOfSequences :: uint2 :: uint2 :: uint2 :: ("reserved sequence section modes" | constant(BitVector.bits(Iterable(false, false))))).flatConcat {
+  def sequenceSectionHeader(blockState: BlockState): Codec[SequenceSectionHeader] =
+    "sequenceSectionHeader" | (numberOfSequences :: uint2 :: uint2 :: uint2 :: ("reserved sequence section modes" | constant(BitVector.bits(Iterable(false, false))))).flatConcat {
       case num :: lMode :: oMode :: mLMode :: _ :: HNil =>
-        def tableFor(mode: Int, defaultSpec: FSETableSpec): Codec[FSETableSpec] = {
+        def tableFor(mode: Int, defaultSpec: FSETableSpec, previous: BlockState => Option[FSETableSpec]): Codec[FSETableSpec] = {
           mode match {
             case 0 => provide(defaultSpec)
             case 2 => fseTableSpec
+            case 3 => provide(previous(blockState).getOrElse(throw new IllegalStateException("Treeless_Literals_Block but previous instance was missing")))
           }
         }
         println(s"num seqs $num modes $lMode $oMode $mLMode")
 
-        tableFor(lMode, DefaultLitLenTable) :: tableFor(oMode, DefaultOffsetTable) :: tableFor(mLMode, DefaultMatchLenTable)
+        tableFor(lMode, DefaultLitLenTable, _.litLenTable) :: tableFor(oMode, DefaultOffsetTable, _.offsetTable) :: tableFor(mLMode, DefaultMatchLenTable, _.matchLenTable)
     }
       .as[SequenceSectionHeader]
 

@@ -471,7 +471,7 @@ object Zstd {
     private val states: IndexedSeq[FSEState[T]] = entries.map { e =>
       new FSEState[T] {
         override def decodeSymbol: Codec[T] = e.decodeSymbol
-        override def decodeNextState: Codec[FSEState[T]] = readExtra(e.nbBits).mapD(states)
+        override def decodeNextState: Codec[FSEState[T]] = readExtra(e.nbBits).mapD(bs => states(e.offset + bs))
 
         override def toString: String = s"State ${e.symbol}"
       }

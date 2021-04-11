@@ -1,7 +1,7 @@
 package net.virtualvoid.codecs.zstd
 
 import net.virtualvoid.codecs.Utils
-import Utils._
+import net.virtualvoid.codecs.Utils._
 import net.virtualvoid.codecs.gzip.Gzip
 import scodec.bits.{ BitVector, ByteVector, HexStringSyntax }
 import scodec.codecs._
@@ -9,9 +9,6 @@ import scodec.{ Attempt, Codec, DecodeResult, SizeBound }
 import shapeless._
 
 import java.io.FileInputStream
-import scala.annotation.tailrec
-import scala.collection.immutable.VectorBuilder
-import scala.util.control.NoStackTrace
 
 object Zstd {
   case class Frame(
@@ -342,7 +339,7 @@ object Zstd {
             case litLenState :: offsetState :: matchLenState :: HNil =>
               println(litLenState, offsetState, matchLenState)
 
-              val seqs = collectWithState(header.numberOfSequences :: litLenState :: matchLenState :: offsetState :: HNil) {
+              val seqs = Utils.collectWithState(header.numberOfSequences :: litLenState :: matchLenState :: offsetState :: HNil) {
                 case remaining :: litLenState :: matchLenState :: offsetState :: HNil =>
                   val nextSeq =
                     (offsetState.decodeSymbol :: matchLenState.decodeSymbol :: litLenState.decodeSymbol).mapD {
@@ -358,33 +355,6 @@ object Zstd {
           }
         }
       }
-    }
-
-  /**
-   * Starting from an initial state, `nextCodec` provides a codec that reads the next value and optionally a new state.
-   * The resulting codec collects all values until this function returns no new state.
-   */
-  def collectWithState[T, S](initialState: S)(nextCodec: S => Codec[(T, Option[S])]): Codec[Seq[T]] =
-    new Codec[Seq[T]] {
-      override def decode(bits: BitVector): Attempt[DecodeResult[Seq[T]]] = {
-        @tailrec
-        def next(bits: BitVector, state: S, collected: VectorBuilder[T]): Attempt[DecodeResult[Seq[T]]] =
-          nextCodec(state).decode(bits) match {
-            case Attempt.Successful(DecodeResult((nextEle, nextStateO), bits)) =>
-              collected += nextEle
-              nextStateO match {
-                case Some(nextState) => next(bits, nextState, collected)
-                case None            => Attempt.Successful(DecodeResult(collected.result(), bits))
-              }
-
-            case f: Attempt.Failure => f
-          }
-
-        next(bits, initialState, new VectorBuilder[T])
-      }
-
-      override def sizeBound: SizeBound = SizeBound.unknown
-      override def encode(value: Seq[T]): Attempt[BitVector] = ???
     }
 
   case class SequenceSectionHeader(

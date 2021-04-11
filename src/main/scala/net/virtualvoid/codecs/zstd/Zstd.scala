@@ -9,6 +9,9 @@ import scodec.{ Attempt, Codec, DecodeResult, SizeBound }
 import shapeless._
 
 import java.io.FileInputStream
+import scala.annotation.tailrec
+import scala.collection.immutable.VectorBuilder
+import scala.util.control.NoStackTrace
 
 object Zstd {
   case class Frame(
@@ -339,32 +342,49 @@ object Zstd {
             case litLenState :: offsetState :: matchLenState :: HNil =>
               println(litLenState, offsetState, matchLenState)
 
-              def nextSequence(remaining: Int, litLenState: FSEState[Int], offsetState: FSEState[Offset], matchLenState: FSEState[Int], current: Vector[Sequence]): Codec[Seq[Sequence]] =
-                if (remaining == 0) provide(current)
-                else {
-                  // offset, matchlen, lit
+              val seqs = collectWithState(header.numberOfSequences :: litLenState :: matchLenState :: offsetState :: HNil) {
+                case remaining :: litLenState :: matchLenState :: offsetState :: HNil =>
+                  val nextSeq =
+                    (offsetState.decodeSymbol :: matchLenState.decodeSymbol :: litLenState.decodeSymbol).mapD {
+                      case offset :: matchLen :: litLen :: HNil => Sequence(litLen, matchLen, offset)
+                    }
 
-                  (offsetState.decodeSymbol :: matchLenState.decodeSymbol :: litLenState.decodeSymbol).flatMapD {
-                    case offset :: matchLen :: litLen :: HNil =>
-                      println(s"Offset: $offset")
-                      println(s"MatchLen: $matchLen")
-                      println(s"LitLen: $litLen")
+                  val nextState = conditional(remaining > 1, provide(remaining - 1) :: litLenState.decodeNextState :: matchLenState.decodeNextState :: offsetState.decodeNextState)
 
-                      val allSeqs: Vector[Sequence] = current :+ Sequence(litLen, matchLen, offset)
-                      if (remaining > 1)
-                        // state update: `Literals_Length_State` is updated, followed by `Match_Length_State`, and then `Offset_State`
-                        (litLenState.decodeNextState :: matchLenState.decodeNextState :: offsetState.decodeNextState).flatMapD {
-                          case ll :: ml :: o :: HNil =>
-                            nextSequence(remaining - 1, ll, o, ml, allSeqs)
-                        }
-                      else provide(allSeqs: Seq[Sequence])
-                  }
-                }
+                  nextSeq ~ nextState
+              }
 
-              (provide(header) :: nextSequence(header.numberOfSequences, litLenState, offsetState, matchLenState, Vector.empty)).as[Sequences]
+              (provide(header) :: seqs).as[Sequences]
           }
         }
       }
+    }
+
+  /**
+   * Starting from an initial state, `nextCodec` provides a codec that reads the next value and optionally a new state.
+   * The resulting codec collects all values until this function returns no new state.
+   */
+  def collectWithState[T, S](initialState: S)(nextCodec: S => Codec[(T, Option[S])]): Codec[Seq[T]] =
+    new Codec[Seq[T]] {
+      override def decode(bits: BitVector): Attempt[DecodeResult[Seq[T]]] = {
+        @tailrec
+        def next(bits: BitVector, state: S, collected: VectorBuilder[T]): Attempt[DecodeResult[Seq[T]]] =
+          nextCodec(state).decode(bits) match {
+            case Attempt.Successful(DecodeResult((nextEle, nextStateO), bits)) =>
+              collected += nextEle
+              nextStateO match {
+                case Some(nextState) => next(bits, nextState, collected)
+                case None            => Attempt.Successful(DecodeResult(collected.result(), bits))
+              }
+
+            case f: Attempt.Failure => f
+          }
+
+        next(bits, initialState, new VectorBuilder[T])
+      }
+
+      override def sizeBound: SizeBound = SizeBound.unknown
+      override def encode(value: Seq[T]): Attempt[BitVector] = ???
     }
 
   case class SequenceSectionHeader(

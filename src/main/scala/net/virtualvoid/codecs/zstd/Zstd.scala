@@ -399,14 +399,14 @@ object Zstd {
 
   lazy val sequenceSectionHeader: Codec[SequenceSectionHeader] =
     (numberOfSequences :: uint2 :: uint2 :: uint2 :: ("reserved sequence section modes" | constant(BitVector.bits(Iterable(false, false))))).flatConcat {
-      case _ :: lMode :: oMode :: mLMode :: _ :: HNil =>
+      case num :: lMode :: oMode :: mLMode :: _ :: HNil =>
         def tableFor(mode: Int, defaultSpec: FSETableSpec): Codec[FSETableSpec] = {
           mode match {
             case 0 => provide(defaultSpec)
             case 2 => fseTableSpec
           }
         }
-        println(s"modes $lMode $oMode $mLMode")
+        println(s"num seqs $num modes $lMode $oMode $mLMode")
 
         tableFor(lMode, DefaultLitLenTable) :: tableFor(oMode, DefaultOffsetTable) :: tableFor(mLMode, DefaultMatchLenTable)
     }

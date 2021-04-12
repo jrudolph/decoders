@@ -26,13 +26,13 @@ class ZStdSpec extends AnyFreeSpec with Matchers {
       }
       "Literals" - {
         "raw literals with short size" in {
-          hex"20 61 62 63 64" must fullyDecodeTo(Zstd.literals, Literals(LiteralSpec(0, 4, 4, 1), ByteVector.encodeAscii("abcd").right.get))
+          hex"20 61 62 63 64" must fullyDecodeTo(Zstd.literals, Literals(LiteralSpec(0, 4, 4, 1), None, ByteVector.encodeAscii("abcd").right.get))
         }
       }
       "Sequences" - {
         "using predefined tables" in {
           hex"03 00 00 02 61 61 a8 7b 90 72 43" must fullyDecodeTo(
-            Zstd.sequences,
+            Zstd.sequences(BlockState.initial),
             Sequences(
               SequenceSectionHeader(3, 0, 0, 0, DefaultLitLenTable, DefaultOffsetTable, DefaultMatchLenTable),
               Seq(Sequence(3, 138, DirectOffset(3)), Sequence(1, 135, DirectOffset(136)), Sequence(0, 24, RepeatedOffset(1)))

@@ -175,7 +175,7 @@ object Zstd {
           case 0 => // raw literals
             val len = sizeFormat match {
               case 0 => lenBits << 1
-              case 1 => lenBits << 1 + 1
+              case 2 => (lenBits << 1) + 1
             }
             (provide(tpe) :: provide(len) :: provide(len) :: provide(1)).as[LiteralSpec]
           case 2 => // Compressed_Literals_Block

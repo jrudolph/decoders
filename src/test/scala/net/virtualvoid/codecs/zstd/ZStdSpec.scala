@@ -47,7 +47,7 @@ class ZStdSpec extends AnyFreeSpec with Matchers {
             Zstd.sequences(BlockState.initial),
             Sequences(
               SequenceSectionHeader(3, 0, 0, 0, DefaultLitLenTable, DefaultOffsetTable, DefaultMatchLenTable),
-              Seq(Sequence(3, 138, DirectOffset(3)), Sequence(1, 135, DirectOffset(136)), Sequence(0, 24, RepeatedOffset(1)))
+              Seq(Sequence(3, 138, DirectOffset(3)), Sequence(1, 135, DirectOffset(136)), Sequence(0, 24, RepeatedOffset(0)))
             )
           )
         }

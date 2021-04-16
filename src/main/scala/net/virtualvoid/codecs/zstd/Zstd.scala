@@ -11,6 +11,9 @@ import java.io.FileInputStream
 import scala.annotation.tailrec
 
 object Zstd {
+  private val TRACE = false
+  def trace(o: Any): Unit = if (TRACE) trace(o.toString)
+
   case class Frame(
       header:   FrameHeader,
       blocks:   Seq[Block],
@@ -116,8 +119,8 @@ object Zstd {
     }
     val fcsBase = if (frameContentSizeLength == 2) 256 else 0
 
-    //println(desc)
-    //println(s"fcs_length: $frameContentSizeLength")
+    //trace(desc)
+    //trace(s"fcs_length: $frameContentSizeLength")
     val frameContentSize = {
       if (frameContentSizeLength > 0)
         ulongL(frameContentSizeLength * 8).xmap[Long](_ + fcsBase, _ - fcsBase)
@@ -244,7 +247,7 @@ object Zstd {
                   uint16L.flatMapD { len =>
                     val regenSize = ((len & 0x3f) << 4) + lenBits
                     val compSize = len >> 6
-                    //println(s"lenBits: ${lenBits.toHexString} len: ${len.toHexString} regenSize: $regenSize compSize: $compSize ${(len & 0x3f).toHexString}")
+                    //trace(s"lenBits: ${lenBits.toHexString} len: ${len.toHexString} regenSize: $regenSize compSize: $compSize ${(len & 0x3f).toHexString}")
                     provide(regenSize) :: provide(compSize) :: provide(numStreams)
                   }
                 case 2 =>
@@ -292,7 +295,7 @@ object Zstd {
       val maxNumberOfBits = java.lang.Integer.numberOfTrailingZeros(nextPowerOf2)
       val remainingBins = nextPowerOf2 - totalWeights
       val lastWeight = java.lang.Integer.numberOfTrailingZeros(remainingBins) + 1
-      println(s"totalWeights: $totalWeights nextPowerOf2: $nextPowerOf2 remaining: $remainingBins last weight: $lastWeight")
+      trace(s"totalWeights: $totalWeights nextPowerOf2: $nextPowerOf2 remaining: $remainingBins last weight: $lastWeight")
 
       new HuffmanSpec(maxNumberOfBits, collectedWeights :+ lastWeight)
     }
@@ -309,7 +312,7 @@ object Zstd {
     def read(code: Int): HuffmanEntry =
       entries.find { e =>
         //val masked = code & e.mask
-        //println(s"${masked.toBinaryString} ${e.shiftedCode.toBinaryString} ${(code & e.mask) == e.code} at ${e.toString(maxNumberOfBits)}")
+        //trace(s"${masked.toBinaryString} ${e.shiftedCode.toBinaryString} ${(code & e.mask) == e.code} at ${e.toString(maxNumberOfBits)}")
         (code & e.mask) == e.shiftedCode
       }.get
   }
@@ -326,11 +329,11 @@ object Zstd {
   lazy val huffmanSpec: Codec[HuffmanSpec] = {
     fseTableSpec.flatMapD { tableSpec =>
       val table = tableSpec.toTable((0 to 20).map(provide))
-      println(s"Huffman table weights FSE: $table")
+      trace(s"Huffman table weights FSE: $table")
       def nextValues(state1: Int, state2: Int, current: Seq[Int]): Codec[HuffmanSpec] = {
         val v1Entry = table.entries(state1)
         val v2Entry = table.entries(state2)
-        println(s"Read entries ${v1Entry.symbol} ${v2Entry.symbol}")
+        trace(s"Read entries ${v1Entry.symbol} ${v2Entry.symbol}")
 
         ifEnoughDataAvailable(readExtra(v1Entry.nbBits) :: readExtra(v2Entry.nbBits)).flatMapD {
           case Some(newState1 :: newState2 :: HNil) =>
@@ -348,7 +351,7 @@ object Zstd {
         withReversedBits {
           (padding ~> uint(tableSpec.accuracyLog) :: uint(tableSpec.accuracyLog)).flatMapD {
             case state1 :: state2 :: HNil =>
-              println(s"Start states state1: $state1 state2: $state2")
+              trace(s"Start states state1: $state1 state2: $state2")
               nextValues(state1, state2, Nil)
           }
         }
@@ -364,8 +367,8 @@ object Zstd {
 
   def compressedLiterals(spec: LiteralSpec): Codec[Option[HuffmanSpec] :: ByteVector :: HNil] =
     variableSizeBytes(uint8, huffmanSpec).flatMapD { huffmanSpec =>
-      println(s"Lit Spec: $spec Huffman Spec: $huffmanSpec")
-      println(huffmanSpec.toTable)
+      trace(s"Lit Spec: $spec Huffman Spec: $huffmanSpec")
+      trace(huffmanSpec.toTable)
 
       provide(Some(huffmanSpec): Option[HuffmanSpec]) :: {
         if (spec.numStreams == 4)
@@ -394,9 +397,9 @@ object Zstd {
         appendInput(ByteVector(0)) {
           def readOne: Codec[Int] =
             peek(uint(table.maxNumberOfBits)).flatMapD { v =>
-              //println(s"Read ${v.toBinaryString}")
+              //trace(s"Read ${v.toBinaryString}")
               val entry = table.read(v)
-              //println(s"${char(entry.symbol)} Found entry: $entry")
+              //trace(s"${char(entry.symbol)} Found entry: $entry")
 
               ignore(entry.numberOfBits) ~> provide(entry.symbol)
             }
@@ -415,24 +418,25 @@ object Zstd {
       val matchLenTable = header.matchLengthTable.toTable(MatchLenCodeTable)
       val offsetTable = header.offsetTable.toTable(OffsetCodeTable)
 
-      println("Litlen")
-      println(header.litLengthTable.histogram)
-      println(litLenTable)
-      println("MatchLen")
-      println(header.matchLengthTable.histogram)
-      println(matchLenTable)
-      println("Offset")
-      println(header.offsetTable.histogram)
-      println(offsetTable)
+      trace("Litlen")
+      trace(header.litLengthTable.histogram)
+      trace(litLenTable)
+      trace("MatchLen")
+      trace(header.matchLengthTable.histogram)
+      trace(matchLenTable)
+      trace("Offset")
+      trace(header.offsetTable.histogram)
+      trace(offsetTable)
 
       reversed {
         withReversedBits {
           (padding ~> litLenTable.decodeInitialState :: offsetTable.decodeInitialState :: matchLenTable.decodeInitialState).flatMapD {
             case litLenState :: offsetState :: matchLenState :: HNil =>
-              println(litLenState, offsetState, matchLenState)
+              trace(litLenState, offsetState, matchLenState)
 
               val seqs = Utils.collectWithState(header.numberOfSequences :: litLenState :: matchLenState :: offsetState :: HNil) {
                 case remaining :: litLenState :: matchLenState :: offsetState :: HNil =>
+                  //trace(s"Remaining: $remaining ll: $litLenState ml: $matchLenState o: $offsetState")
                   val nextSeq =
                     (offsetState.decodeSymbol :: matchLenState.decodeSymbol :: litLenState.decodeSymbol).mapD {
                       case offset :: matchLen :: litLen :: HNil => Sequence(litLen, matchLen, offset)
@@ -469,7 +473,7 @@ object Zstd {
             case 3 => provide(previous(blockState).getOrElse(throw new IllegalStateException("Treeless_Literals_Block but previous instance was missing")))
           }
         }
-        println(s"num seqs $num modes $lMode $oMode $mLMode")
+        trace(s"num seqs $num modes $lMode $oMode $mLMode")
 
         tableFor(lMode, DefaultLitLenTable, _.litLenTable) :: tableFor(oMode, DefaultOffsetTable, _.offsetTable) :: tableFor(mLMode, DefaultMatchLenTable, _.matchLenTable)
     }
@@ -528,7 +532,7 @@ object Zstd {
             val bits = java.lang.Integer.numberOfTrailingZeros(width)
             val double = nextPower - count
 
-            println(s"Symbol: $symbol count: $count nextPower: $nextPower width: $width bits: $bits double: $double single: ${count - double}")
+            trace(s"Symbol: $symbol count: $count nextPower: $nextPower width: $width bits: $bits double: $double single: ${count - double}")
 
             val doubleStartOffset = (count - double) * width
             buffer.zipWithIndex.filter(e => e._1 != null && e._1.symbol == symbol).zipWithIndex.foreach {
@@ -708,7 +712,7 @@ object Zstd {
 
               val realCount = value - 1
               val read = if (realCount == -1) 1 else realCount
-              //println(s"accuracyLog: $accuracyLog remaining: $remaining threshold: $threshold max: $max bitsRead: $bitsRead value: $value bitsUsed: $bitsUsed realCount: $realCount")
+              //trace(s"accuracyLog: $accuracyLog remaining: $remaining threshold: $threshold max: $max bitsRead: $bitsRead value: $value bitsUsed: $bitsUsed realCount: $realCount")
               val nextState = ReadState(accuracyLog, remaining - read, counts :+ realCount)
 
               ignore(bitsUsed) ~> (if (realCount == 0) nextState.afterZero else nextState.next)
@@ -736,13 +740,13 @@ object Zstd {
   }
 
   def peekPrintNextBits(num: Int, tag: String): Codec[Unit] =
-    peek(bits(num)).mapD { bv => println(s"$tag: ${bv.toBin}") }
+    peek(bits(num)).mapD { bv => trace(s"$tag: ${bv.toBin}") }
 
   def peekPrintNextBytes(num: Int, tag: String): Codec[Unit] =
-    peek(bytes(num)).mapD { bv => println(s"$tag: ${bv.toHex}") }
+    peek(bytes(num)).mapD { bv => trace(s"$tag: ${bv.toHex}") }
 
   def peekRemainingBytes(tag: String): Codec[Unit] =
-    peek(bytes.mapD { bv => println(s"$tag: ${bv.size} bytes ${bv.toHex}") })
+    peek(bytes.mapD { bv => trace(s"$tag: ${bv.size} bytes ${bv.toHex}") })
 }
 
 object ZstdTest extends App {

@@ -181,12 +181,13 @@ object Zstd {
           case 2 => // Compressed_Literals_Block
             def sizes(sizeFormat: Int): Codec[Int :: Int :: Int :: HNil] =
               sizeFormat match {
-                case 1 =>
+                case 0 | 1 =>
+                  val numStreams = if (sizeFormat == 0) 1 else 4
                   uint16L.flatMapD { len =>
                     val regenSize = ((len & 0x3f) << 4) + lenBits
                     val compSize = len >> 6
                     //println(s"lenBits: ${lenBits.toHexString} len: ${len.toHexString} regenSize: $regenSize compSize: $compSize ${(len & 0x3f).toHexString}")
-                    provide(regenSize) :: provide(compSize) :: provide(4)
+                    provide(regenSize) :: provide(compSize) :: provide(numStreams)
                   }
                 case 2 =>
                   uint24L.flatMapD { len =>

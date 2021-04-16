@@ -15,6 +15,7 @@ object Zstd {
       blocks:   Seq[Block],
       checksum: Option[Long]
   ) {
+    /** Do the actual LZ decoding. It keeps the full output in memory for simplicity */
     def decode: ByteVector = {
       @tailrec
       def processNextBlock(decoded: ByteVector, previousOffsets: Seq[Int], blocks: Seq[Block]): ByteVector = blocks match {
@@ -324,7 +325,7 @@ object Zstd {
       conditional(canRead, inner)
     }
 
-  lazy val huffmanSpec: Codec[HuffmanSpec] = {
+  lazy val huffmanSpec: Codec[HuffmanSpec] =
     fseTableSpec.flatMapD { tableSpec =>
       val table = tableSpec.toTable((0 to 20).map(provide))
       trace(s"Huffman table weights FSE: $table")
@@ -355,7 +356,7 @@ object Zstd {
         }
       }
     }
-  }
+
   def padding: Codec[Unit] =
     peek(uint8).flatMapD { first =>
       val padding = java.lang.Integer.numberOfLeadingZeros(first) - 24 /* uint8 as 32bit int */ + 1

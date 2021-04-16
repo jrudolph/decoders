@@ -10,6 +10,125 @@ import shapeless._
 import scala.annotation.tailrec
 
 object Zstd {
+  /**
+   * The decoding table uses an accuracy log of 6 bits (64 states).
+   *
+   * ```
+   * short literalsLength_defaultDistribution[36] =
+   *         { 4, 3, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1,
+   *           2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 2, 1, 1, 1, 1, 1,
+   *          -1,-1,-1,-1 };
+   * ```
+   */
+  val DefaultLitLenTable =
+    FSETableSpec(6, Seq(4, 3, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 2, 1, 1, 1, 1, 1, -1, -1, -1, -1))
+
+  /**
+   * The decoding table uses an accuracy log of 6 bits (64 states).
+   * ```
+   * short matchLengths_defaultDistribution[53] =
+   *         { 1, 4, 3, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1,
+   *           1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+   *           1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,-1,-1,
+   *          -1,-1,-1,-1,-1 };
+   * ```
+   */
+  val DefaultMatchLenTable =
+    FSETableSpec(6, Seq(1, 4, 3, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1, -1, -1))
+
+  /**
+   * The decoding table uses an accuracy log of 5 bits (32 states),
+   * and supports a maximum `N` value of 28, allowing offset values up to 536,870,908 .
+   *
+   * If any sequence in the compressed block requires a larger offset than this,
+   * it's not possible to use the default distribution to represent it.
+   * ```
+   * short offsetCodes_defaultDistribution[29] =
+   *         { 1, 1, 1, 1, 1, 1, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1,
+   *           1, 1, 1, 1, 1, 1, 1, 1,-1,-1,-1,-1,-1 };
+   * ```
+   */
+  val DefaultOffsetTable =
+    FSETableSpec(5, Seq(1, 1, 1, 1, 1, 1, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1))
+
+  /**
+   * | `Literals_Length_Code` |         0-15           |
+   * | ---------------------- | ---------------------- |
+   * | length                 | `Literals_Length_Code` |
+   * | `Number_of_Bits`       |          0             |
+   *
+   * | `Literals_Length_Code` |  16  |  17  |  18  |  19  |  20  |  21  |  22  |  23  |
+   * | ---------------------- | ---- | ---- | ---- | ---- | ---- | ---- | ---- | ---- |
+   * | `Baseline`             |  16  |  18  |  20  |  22  |  24  |  28  |  32  |  40  |
+   * | `Number_of_Bits`       |   1  |   1  |   1  |   1  |   2  |   2  |   3  |   3  |
+   *
+   * | `Literals_Length_Code` |  24  |  25  |  26  |  27  |  28  |  29  |  30  |  31  |
+   * | ---------------------- | ---- | ---- | ---- | ---- | ---- | ---- | ---- | ---- |
+   * | `Baseline`             |  48  |  64  |  128 |  256 |  512 | 1024 | 2048 | 4096 |
+   * | `Number_of_Bits`       |   4  |   6  |   7  |   8  |   9  |  10  |  11  |  12  |
+   *
+   * | `Literals_Length_Code` |  32  |  33  |  34  |  35  |
+   * | ---------------------- | ---- | ---- | ---- | ---- |
+   * | `Baseline`             | 8192 |16384 |32768 |65536 |
+   * | `Number_of_Bits`       |  13  |  14  |  15  |  16  |
+   */
+  val LitLenCodeTable: IndexedSeq[Codec[Int]] =
+    intCodeTableWithExtraBits(0, Vector.fill(16)(0) ++ Vector(1, 1, 1, 1, 2, 2, 3, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16))
+
+  /**
+   * | `Match_Length_Code` |         0-31            |
+   * | ------------------- | ----------------------- |
+   * | value               | `Match_Length_Code` + 3 |
+   * | `Number_of_Bits`    |          0              |
+   *
+   * | `Match_Length_Code` |  32  |  33  |  34  |  35  |  36  |  37  |  38  |  39  |
+   * | ------------------- | ---- | ---- | ---- | ---- | ---- | ---- | ---- | ---- |
+   * | `Baseline`          |  35  |  37  |  39  |  41  |  43  |  47  |  51  |  59  |
+   * | `Number_of_Bits`    |   1  |   1  |   1  |   1  |   2  |   2  |   3  |   3  |
+   *
+   * | `Match_Length_Code` |  40  |  41  |  42  |  43  |  44  |  45  |  46  |  47  |
+   * | ------------------- | ---- | ---- | ---- | ---- | ---- | ---- | ---- | ---- |
+   * | `Baseline`          |  67  |  83  |  99  |  131 |  259 |  515 | 1027 | 2051 |
+   * | `Number_of_Bits`    |   4  |   4  |   5  |   7  |   8  |   9  |  10  |  11  |
+   *
+   * | `Match_Length_Code` |  48  |  49  |  50  |  51  |  52  |
+   * | ------------------- | ---- | ---- | ---- | ---- | ---- |
+   * | `Baseline`          | 4099 | 8195 |16387 |32771 |65539 |
+   * | `Number_of_Bits`    |  12  |  13  |  14  |  15  |  16  |
+   */
+  val MatchLenCodeTable: IndexedSeq[Codec[Int]] =
+    intCodeTableWithExtraBits(3, Vector.fill(32)(0) ++ Vector(1, 1, 1, 1, 2, 2, 3, 3, 4, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16))
+
+  /**
+   * Offset codes are values ranging from `0` to `N`.
+   *
+   * An offset code is also the number of additional bits to read in __little-endian__ fashion,
+   * and can be translated into an `Offset_Value` using the following formulas :
+   *
+   * ```
+   * Offset_Value = (1 << offsetCode) + readNBits(offsetCode);
+   * if (Offset_Value > 3) offset = Offset_Value - 3;
+   * ```
+   *
+   * `Offset_Value` from 1 to 3 are special : they define "repeat codes".
+   */
+  val OffsetCodeTable: IndexedSeq[Codec[Offset]] =
+    (0 to 31).map { offsetCode =>
+      readExtra(offsetCode).mapD { offsetExtra =>
+        val offsetValue = (1 << offsetCode) + offsetExtra
+
+        if (offsetValue > 3) DirectOffset(offsetValue - 3)
+        else RepeatedOffset(offsetValue - 1)
+      }
+    }
+
+  /**
+   * For the first block, the starting offset history is populated with following values :
+   * `Repeated_Offset1`=1, `Repeated_Offset2`=4, `Repeated_Offset3`=8,
+   * unless a dictionary is used, in which case they come from the dictionary.
+   */
+  val InitialOffsetHistory = Seq(1, 4, 8)
+
   case class Frame(
       header:   FrameHeader,
       blocks:   Seq[Block],
@@ -18,40 +137,40 @@ object Zstd {
     /** Do the actual LZ decoding. It keeps the full output in memory for simplicity */
     def decode: ByteVector = {
       @tailrec
-      def processNextBlock(decoded: ByteVector, previousOffsets: Seq[Int], blocks: Seq[Block]): ByteVector = blocks match {
+      def processNextBlock(decoded: ByteVector, offsetHistory: Seq[Int], blocks: Seq[Block]): ByteVector = blocks match {
         case Nil => decoded
         case CompressedBlock(_, Literals(_, _, lits), Sequences(_, seqs)) +: rest =>
-          val (newDecoded, lastOffs) = processSequence(decoded, lits, previousOffsets, seqs)
+          val (newDecoded, lastOffs) = processSequence(decoded, lits, offsetHistory, seqs)
           processNextBlock(newDecoded, lastOffs, rest)
       }
       @tailrec
-      def processSequence(decoded: ByteVector, literals: ByteVector, previousOffsets: Seq[Int], sequences: Seq[Sequence]): (ByteVector, Seq[Int]) = sequences match {
-        case Nil => (decoded ++ literals, previousOffsets) // append remaining literals at the end
+      def processSequence(decoded: ByteVector, literals: ByteVector, offsetHistory: Seq[Int], sequences: Seq[Sequence]): (ByteVector, Seq[Int]) = sequences match {
+        case Nil => (decoded ++ literals, offsetHistory) // append remaining literals at the end
         case Sequence(litLen, matchLen, offset) +: rest =>
           val dec0 = decoded ++ literals.take(litLen)
           val (off, newOffs) = offset match {
             case DirectOffset(offset) =>
-              (offset, offset +: previousOffsets.dropRight(1))
+              (offset, offset +: offsetHistory.dropRight(1))
             case RepeatedOffset(idx) if litLen > 0 =>
-              val thisOff = previousOffsets(idx)
+              val thisOff = offsetHistory(idx)
               val newOffs = idx match {
-                case 0 => previousOffsets
-                case 1 => Seq(previousOffsets(1), previousOffsets(0), previousOffsets(2))
-                case 2 => Seq(previousOffsets(2), previousOffsets(0), previousOffsets(1))
+                case 0 => offsetHistory
+                case 1 => Seq(offsetHistory(1), offsetHistory(0), offsetHistory(2))
+                case 2 => Seq(offsetHistory(2), offsetHistory(0), offsetHistory(1))
               }
               (thisOff, newOffs)
 
             case RepeatedOffset(idx) =>
               val thisOff = idx match {
-                case 0 => previousOffsets(1)
-                case 1 => previousOffsets(2)
-                case 2 => previousOffsets(0) - 1
+                case 0 => offsetHistory(1)
+                case 1 => offsetHistory(2)
+                case 2 => offsetHistory(0) - 1
               }
 
               val newOffs = idx match {
-                case 0 => Seq(previousOffsets(1), previousOffsets(0), previousOffsets(2))
-                case 1 => Seq(previousOffsets(2), previousOffsets(0), previousOffsets(1))
-                case 2 => Seq(thisOff, previousOffsets(1), previousOffsets(2))
+                case 0 => Seq(offsetHistory(1), offsetHistory(0), offsetHistory(2))
+                case 1 => Seq(offsetHistory(2), offsetHistory(0), offsetHistory(1))
+                case 2 => Seq(thisOff, offsetHistory(1), offsetHistory(2))
               }
               (thisOff, newOffs)
           }
@@ -68,7 +187,7 @@ object Zstd {
           processSequence(all, literals.drop(litLen), newOffs, rest)
       }
 
-      val result = processNextBlock(ByteVector.empty, Seq(1, 4, 8), blocks)
+      val result = processNextBlock(ByteVector.empty, InitialOffsetHistory, blocks)
       require(header.frameContentSize == -1 || result.size == header.frameContentSize, s"Result size ${result.size} != frame content size ${header.frameContentSize}")
       result
     }
@@ -581,76 +700,7 @@ object Zstd {
       }.mkString("\n")
   }
 
-  lazy val DefaultLitLenTable =
-    FSETableSpec(6, Seq(4, 3, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 2, 1, 1, 1, 1, 1, -1, -1, -1, -1))
-
-  lazy val DefaultMatchLenTable =
-    FSETableSpec(6, Seq(1, 4, 3, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1, -1, -1))
-
-  lazy val DefaultOffsetTable =
-    FSETableSpec(5, Seq(1, 1, 1, 1, 1, 1, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1))
-
-  /*
-  | `Match_Length_Code` |         0-31            |
-  | ------------------- | ----------------------- |
-  | value               | `Match_Length_Code` + 3 |
-  | `Number_of_Bits`    |          0              |
-
-  | `Match_Length_Code` |  32  |  33  |  34  |  35  |  36  |  37  |  38  |  39  |
-  | ------------------- | ---- | ---- | ---- | ---- | ---- | ---- | ---- | ---- |
-  | `Baseline`          |  35  |  37  |  39  |  41  |  43  |  47  |  51  |  59  |
-  | `Number_of_Bits`    |   1  |   1  |   1  |   1  |   2  |   2  |   3  |   3  |
-
-  | `Match_Length_Code` |  40  |  41  |  42  |  43  |  44  |  45  |  46  |  47  |
-  | ------------------- | ---- | ---- | ---- | ---- | ---- | ---- | ---- | ---- |
-  | `Baseline`          |  67  |  83  |  99  |  131 |  259 |  515 | 1027 | 2051 |
-  | `Number_of_Bits`    |   4  |   4  |   5  |   7  |   8  |   9  |  10  |  11  |
-
-  | `Match_Length_Code` |  48  |  49  |  50  |  51  |  52  |
-  | ------------------- | ---- | ---- | ---- | ---- | ---- |
-  | `Baseline`          | 4099 | 8195 |16387 |32771 |65539 |
-  | `Number_of_Bits`    |  12  |  13  |  14  |  15  |  16  |
-   */
-
-  lazy val OffsetCodeTable: IndexedSeq[Codec[Offset]] =
-    (0 to 31).map { offsetCode =>
-      readExtra(offsetCode).mapD { offsetExtra =>
-        val offsetValue = (1 << offsetCode) + offsetExtra
-
-        if (offsetValue > 3) DirectOffset(offsetValue - 3)
-        else RepeatedOffset(offsetValue - 1)
-      }
-    }
-
-  lazy val MatchLenCodeTable: IndexedSeq[Codec[Int]] =
-    intCodeTableWithExtraBits(3, Vector.fill(32)(0) ++ Vector(1, 1, 1, 1, 2, 2, 3, 3, 4, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16))
-
-  /*
-  | `Literals_Length_Code` |         0-15           |
-  | ---------------------- | ---------------------- |
-  | length                 | `Literals_Length_Code` |
-  | `Number_of_Bits`       |          0             |
-
-  | `Literals_Length_Code` |  16  |  17  |  18  |  19  |  20  |  21  |  22  |  23  |
-  | ---------------------- | ---- | ---- | ---- | ---- | ---- | ---- | ---- | ---- |
-  | `Baseline`             |  16  |  18  |  20  |  22  |  24  |  28  |  32  |  40  |
-  | `Number_of_Bits`       |   1  |   1  |   1  |   1  |   2  |   2  |   3  |   3  |
-
-  | `Literals_Length_Code` |  24  |  25  |  26  |  27  |  28  |  29  |  30  |  31  |
-  | ---------------------- | ---- | ---- | ---- | ---- | ---- | ---- | ---- | ---- |
-  | `Baseline`             |  48  |  64  |  128 |  256 |  512 | 1024 | 2048 | 4096 |
-  | `Number_of_Bits`       |   4  |   6  |   7  |   8  |   9  |  10  |  11  |  12  |
-
-  | `Literals_Length_Code` |  32  |  33  |  34  |  35  |
-  | ---------------------- | ---- | ---- | ---- | ---- |
-  | `Baseline`             | 8192 |16384 |32768 |65536 |
-  | `Number_of_Bits`       |  13  |  14  |  15  |  16  |
-   */
-
-  lazy val LitLenCodeTable: IndexedSeq[Codec[Int]] =
-    intCodeTableWithExtraBits(0, Vector.fill(16)(0) ++ Vector(1, 1, 1, 1, 2, 2, 3, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16))
-
-  def intCodeTableWithExtraBits(base: Int, extraBits: Vector[Int]): IndexedSeq[Codec[Int]] = {
+  private def intCodeTableWithExtraBits(base: Int, extraBits: Vector[Int]): IndexedSeq[Codec[Int]] = {
     case class Code(baseline: Int, extraBits: Int)
 
     val first = extraBits.head

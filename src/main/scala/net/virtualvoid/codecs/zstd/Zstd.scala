@@ -8,13 +8,71 @@ import scodec.{ Attempt, Codec, DecodeResult, SizeBound }
 import shapeless._
 
 import java.io.FileInputStream
+import scala.annotation.tailrec
 
 object Zstd {
   case class Frame(
       header:   FrameHeader,
       blocks:   Seq[Block],
       checksum: Option[Long]
-  )
+  ) {
+    def decode: ByteVector = {
+      @tailrec
+      def processNextBlock(decoded: ByteVector, previousOffsets: Seq[Int], blocks: Seq[Block]): ByteVector = blocks match {
+        case Nil => decoded
+        case CompressedBlock(_, Literals(_, _, lits), Sequences(_, seqs)) +: rest =>
+          val (newDecoded, lastOffs) = processSequence(decoded, lits, previousOffsets, seqs)
+          processNextBlock(newDecoded, lastOffs, rest)
+      }
+      @tailrec
+      def processSequence(decoded: ByteVector, literals: ByteVector, previousOffsets: Seq[Int], sequences: Seq[Sequence]): (ByteVector, Seq[Int]) = sequences match {
+        case Nil => (decoded ++ literals, previousOffsets) // append remaining literals at the end
+        case Sequence(litLen, matchLen, offset) +: rest =>
+          val dec0 = decoded ++ literals.take(litLen)
+          val (off, newOffs) = offset match {
+            case DirectOffset(offset) =>
+              (offset, offset +: previousOffsets.dropRight(1))
+            case RepeatedOffset(idx) if litLen > 0 =>
+              val thisOff = previousOffsets(idx)
+              val newOffs = idx match {
+                case 0 => previousOffsets
+                case 1 => Seq(previousOffsets(1), previousOffsets(0), previousOffsets(2))
+                case 2 => Seq(previousOffsets(2), previousOffsets(0), previousOffsets(1))
+              }
+              (thisOff, newOffs)
+
+            case RepeatedOffset(idx) =>
+              val thisOff = idx match {
+                case 0 => previousOffsets(1)
+                case 1 => previousOffsets(2)
+                case 2 => previousOffsets(0) - 1
+              }
+
+              val newOffs = idx match {
+                case 0 => Seq(previousOffsets(1), previousOffsets(0), previousOffsets(2))
+                case 1 => Seq(previousOffsets(2), previousOffsets(0), previousOffsets(1))
+                case 2 => Seq(thisOff, previousOffsets(1), previousOffsets(2))
+              }
+              (thisOff, newOffs)
+          }
+          /** Resolves overlapping matches (probably not in the fastest way) */
+          def includingMatch(window: ByteVector, offset: Int, matchLen: Int): ByteVector = {
+            val thisMatchLen = math.min(matchLen, offset)
+            val remainingMatchLen = matchLen - thisMatchLen
+            val after = window ++ window.slice(window.size - off, window.size - off + matchLen)
+            if (remainingMatchLen > 0) includingMatch(after, offset, remainingMatchLen)
+            else after
+          }
+
+          val all = includingMatch(dec0, off, matchLen)
+          processSequence(all, literals.drop(litLen), newOffs, rest)
+      }
+
+      val result = processNextBlock(ByteVector.empty, Seq(1, 4, 8), blocks)
+      require(header.frameContentSize == -1 || result.size == header.frameContentSize, s"Result size ${result.size} != frame content size ${header.frameContentSize}")
+      result
+    }
+  }
 
   lazy val frame: Codec[Frame] =
     frameHeader.flatPrepend { header =>
@@ -557,7 +615,7 @@ object Zstd {
         val offsetValue = (1 << offsetCode) + offsetExtra
 
         if (offsetValue > 3) DirectOffset(offsetValue - 3)
-        else RepeatedOffset(offsetValue)
+        else RepeatedOffset(offsetValue - 1)
       }
     }
 
@@ -702,8 +760,12 @@ object ZstdTest extends App {
   val res = Zstd.frame.decode(data.toBitVector)
   println(s"Result: $res")
   if (res.isFailure) println(s"Context: ${res.toEither.left.get.context}")
-  else
-    println(new String(res.require.value.blocks.head.asInstanceOf[Zstd.CompressedBlock].literals.data.toArray))
+  else {
+    val lits = new String(res.require.value.blocks.head.asInstanceOf[Zstd.CompressedBlock].literals.data.toArray)
+    println(s"Lits: [$lits]")
+    val decoded = res.require.value.decode
+    println(s"fully decoded: [${decoded.decodeUtf8.right.get}]")
+  }
 }
 
 /*

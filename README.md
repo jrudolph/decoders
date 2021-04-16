@@ -13,7 +13,7 @@ It uses Huffman coding for literals and [FSE](http://fastcompression.blogspot.co
 coding (based on [ANS](https://en.wikipedia.org/wiki/Asymmetric_numeral_systems)) for encoding of LZ sequences (tuples of
 literal length, and back reference match length and offsets).
 
-[Implementation](https://github.com/jrudolph/decoders/blob/zstd/src/main/scala/net/virtualvoid/codecs/zstd/Zstd.scala)
+[Implementation](https://github.com/jrudolph/decoders/blob/main/src/main/scala/net/virtualvoid/codecs/zstd/Zstd.scala)
 
 The implementation is somewhat complete, some rarer cases are not yet handled:
 
@@ -28,6 +28,6 @@ Gzip is defined in [RFC 1952](https://tools.ietf.org/html/rfc1952). It is a spec
 encoded data. Deflate is *the* lossless text compression algorithm of the last decades. It's an LZ implementation that uses Huffman codes
 for compression of literals and back references.
 
-[Implementation](https://github.com/jrudolph/decoders/blob/zstd/src/main/scala/net/virtualvoid/codecs/gzip/Gzip.scala)
+[Implementation](https://github.com/jrudolph/decoders/blob/main/src/main/scala/net/virtualvoid/codecs/gzip/Gzip.scala)
 
 The implementation is incomplete but the most important bits are there.

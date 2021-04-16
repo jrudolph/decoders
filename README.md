@@ -21,6 +21,7 @@ The implementation is somewhat complete, some rarer cases are not yet handled:
  * RLE and treeless literals modes
  * RLE sequence mode
  * skip frames
+ * dictionaries
 
 ## Gzip
 

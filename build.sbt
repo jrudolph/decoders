@@ -9,6 +9,11 @@ libraryDependencies ++= Seq(
 
 scalaVersion := scalaV
 
+fork in run := true
+javaOptions in run ++= Seq(
+  "-XX:+PreserveFramePointer", "-verbose:gc"
+)
+
 // docs
 
 enablePlugins(ParadoxMaterialThemePlugin)

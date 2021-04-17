@@ -427,13 +427,20 @@ object Zstd {
     override def toString: String =
       entries.map(_.toString(maxNumberOfBits)).mkString("\n")
 
+    /** A simple lookup table for all values of length `maxNumberOfBits` */
+    private val table: Array[HuffmanEntry] = {
+      val res = new Array[HuffmanEntry](1 << maxNumberOfBits)
+      entries.foreach { e =>
+        val numEntries = 1 << (maxNumberOfBits - e.numberOfBits)
+        (0 until numEntries).foreach { offset =>
+          res(e.shiftedCode + offset) = e
+        }
+      }
+      res
+    }
+
     /** code should contain `maxNumberOfBits` of new data */
-    def read(code: Int): HuffmanEntry =
-      entries.find { e =>
-        //val masked = code & e.mask
-        //trace(s"${masked.toBinaryString} ${e.shiftedCode.toBinaryString} ${(code & e.mask) == e.code} at ${e.toString(maxNumberOfBits)}")
-        (code & e.mask) == e.shiftedCode
-      }.get
+    def read(code: Int): HuffmanEntry = table(code)
   }
   private def binStringWithLeftZeros(num: Int, numberOfBits: Int): String = {
     val str = num.toBinaryString

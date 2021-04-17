@@ -18,7 +18,7 @@ literal length, and back reference match length and offsets).
 The implementation is somewhat complete, some rarer cases are not yet handled:
 
  * some particular multibyte size formats
- * RLE and treeless literals modes
+ * RLE literals mode
  * RLE sequence mode
  * skip frames
  * dictionaries

@@ -26,12 +26,12 @@ class ZStdSpec extends AnyFreeSpec with Matchers {
       }
       "Literals" - {
         "raw literals with short size" in {
-          hex"20 61 62 63 64" must fullyDecodeTo(Zstd.literals, Literals(LiteralSpec(0, 4, 4, 1), None, ByteVector.encodeAscii("abcd").right.get))
+          hex"20 61 62 63 64" must fullyDecodeTo(Zstd.literals(BlockState.initial), Literals(LiteralSpec(0, 4, 4, 1), None, ByteVector.encodeAscii("abcd").right.get))
         }
         "compressed literals" in {
           hex"a244101690c70d90d56263e59360f6bff4ed6edf8c30f5ade802a4f062cbb57220e5a5e2debdc5a3e51dc2ddd3fca42b11dbe2bcc8ec460a2660a91561949e1f60ed4e25" must
             fullyDecodeTo(
-              Zstd.literals,
+              Zstd.literals(BlockState.initial),
               Literals(
                 LiteralSpec(2, 74, 65, 1),
                 Some(HuffmanSpec(6, Seq(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 1, 1, 2, 3, 1, 1, 2, 2, 1, 0, 2, 1, 1, 3, 3, 0, 3, 3, 3, 2, 0, 2, 0, 0, 0, 2, 0, 2))),

@@ -334,14 +334,15 @@ object Zstd {
 
   def compressedBlock(blockState: BlockState, header: BlockHeader): Codec[CompressedBlock] = {
     require(header.blockType == 2) // compressed block
-    (provide(header) :: literals :: sequences(blockState)).as[CompressedBlock]
+    (provide(header) :: literals(blockState) :: sequences(blockState)).as[CompressedBlock]
   }
 
-  lazy val literals: Codec[Literals] =
+  def literals(blockState: BlockState): Codec[Literals] =
     literalSpec.flatPrepend { spec =>
       spec.literalsType match {
         case 0 => provide(None: Option[HuffmanSpec]) :: bytes(spec.compressedSize)
         case 2 => variableSizeBytes(provide(spec.compressedSize), compressedLiterals(spec))
+        case 3 => variableSizeBytes(provide(spec.compressedSize), decodeLiterals(spec, blockState.huffmanSpec.get))
       }
     }.as[Literals]
 
@@ -357,7 +358,7 @@ object Zstd {
               case 2 => (lenBits << 1) + 1
             }
             (provide(tpe) :: provide(len) :: provide(len) :: provide(1)).as[LiteralSpec]
-          case 2 => // Compressed_Literals_Block
+          case 2 | 3 => // Compressed_Literals_Block or Treeless_Literals_Block
             def sizes(sizeFormat: Int): Codec[Int :: Int :: Int :: HNil] =
               sizeFormat match {
                 case 0 | 1 =>
@@ -485,29 +486,33 @@ object Zstd {
 
   def compressedLiterals(spec: LiteralSpec): Codec[Option[HuffmanSpec] :: ByteVector :: HNil] =
     variableSizeBytes(uint8, huffmanSpec).flatMapD { huffmanSpec =>
-      trace(s"Lit Spec: $spec Huffman Spec: $huffmanSpec")
-      trace(huffmanSpec.toTable)
-
-      provide(Some(huffmanSpec): Option[HuffmanSpec]) :: {
-        if (spec.numStreams == 4)
-          (uint16L :: uint16L :: uint16L).flatMapD {
-            case stream1 :: stream2 :: stream3 :: HNil =>
-              val numEls = (spec.regeneratedSize + 3) / 4
-              val remaining = spec.regeneratedSize - 3 * numEls
-
-              (variableSizeBytes(provide(stream1), decodeLiterals(huffmanSpec, numEls)) ::
-                variableSizeBytes(provide(stream2), decodeLiterals(huffmanSpec, numEls)) ::
-                variableSizeBytes(provide(stream3), decodeLiterals(huffmanSpec, numEls)) ::
-                decodeLiterals(huffmanSpec, remaining)).mapD[ByteVector] {
-                  case s1 :: s2 :: s3 :: s4 :: HNil => s1 ++ s2 ++ s3 ++ s4
-                }
-          }
-        else
-          decodeLiterals(huffmanSpec, spec.regeneratedSize)
-      }
+      decodeLiterals(spec, huffmanSpec)
     }
 
-  def decodeLiterals(huffmanSpec: HuffmanSpec, numElements: Int): Codec[ByteVector] = {
+  def decodeLiterals(spec: LiteralSpec, huffmanSpec: HuffmanSpec): Codec[Option[HuffmanSpec] :: ByteVector :: HNil] = {
+    trace(s"Lit Spec: $spec Huffman Spec: $huffmanSpec")
+    trace(huffmanSpec.toTable)
+
+    provide(Some(huffmanSpec): Option[HuffmanSpec]) :: {
+      if (spec.numStreams == 4)
+        (uint16L :: uint16L :: uint16L).flatMapD {
+          case stream1 :: stream2 :: stream3 :: HNil =>
+            val numEls = (spec.regeneratedSize + 3) / 4
+            val remaining = spec.regeneratedSize - 3 * numEls
+
+            (variableSizeBytes(provide(stream1), decodeLiteralStream(huffmanSpec, numEls)) ::
+              variableSizeBytes(provide(stream2), decodeLiteralStream(huffmanSpec, numEls)) ::
+              variableSizeBytes(provide(stream3), decodeLiteralStream(huffmanSpec, numEls)) ::
+              decodeLiteralStream(huffmanSpec, remaining)).mapD[ByteVector] {
+                case s1 :: s2 :: s3 :: s4 :: HNil => s1 ++ s2 ++ s3 ++ s4
+              }
+        }
+      else
+        decodeLiteralStream(huffmanSpec, spec.regeneratedSize)
+    }
+  }
+
+  def decodeLiteralStream(huffmanSpec: HuffmanSpec, numElements: Int): Codec[ByteVector] = {
     val table = huffmanSpec.toTable
 
     reversed {

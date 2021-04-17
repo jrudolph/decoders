@@ -23,6 +23,10 @@ The implementation is somewhat complete, some rarer cases are not yet handled:
  * skip frames
  * dictionaries
 
+### Speed
+
+On a single core (4800H) about 5-20MB/s on JDK8 vs. 2500-4000MB/s zstd 1.4.8, so ~ 100-1000x slower than an optimized version.
+
 ## Gzip
 
 Gzip is defined in [RFC 1952](https://tools.ietf.org/html/rfc1952). It is a special wrapper around DEFLATE ([RFC 1951](https://tools.ietf.org/html/rfc1951))

@@ -165,58 +165,71 @@ object Zstd {
   ) {
     /** Do the actual LZ decoding. It keeps the full output in memory for simplicity */
     def decode: ByteVector = {
+      val output = new Array[Byte](header.frameContentSize.toInt)
       @tailrec
-      def processNextBlock(decoded: ByteVector, offsetHistory: Seq[Int], blocks: Seq[Block]): ByteVector = blocks match {
-        case Nil => decoded
+      def processNextBlock(outputPos: Int, offsetHistory: Seq[Int], blocks: Seq[Block]): ByteVector = blocks match {
+        case Nil => ByteVector(output)
         case CompressedBlock(_, Literals(_, _, lits), Sequences(_, seqs)) +: rest =>
-          val (newDecoded, lastOffs) = processSequence(decoded, lits, offsetHistory, seqs)
-          processNextBlock(newDecoded, lastOffs, rest)
+          val (newOutputPos, lastOffs) = processSequence(outputPos, lits.toArray, 0, offsetHistory, seqs)
+          processNextBlock(newOutputPos, lastOffs, rest)
       }
       @tailrec
-      def processSequence(decoded: ByteVector, literals: ByteVector, offsetHistory: Seq[Int], sequences: Seq[Sequence]): (ByteVector, Seq[Int]) = sequences match {
-        case Nil => (decoded ++ literals, offsetHistory) // append remaining literals at the end
-        case Sequence(litLen, matchLen, offset) +: rest =>
-          val dec0 = decoded ++ literals.take(litLen)
+      def processSequence(outputPos: Int, literals: Array[Byte], litPos: Int, offsetHistory: Seq[Int], sequences: Seq[Sequence]): (Int, Seq[Int]) = sequences match {
+        case Nil =>
+          if (litPos < literals.length)
+            System.arraycopy(literals, litPos, output, outputPos, literals.length - litPos)
+          //literals.copyToArray(output, outputPos)
+          (outputPos + (literals.length - litPos), offsetHistory) // append remaining literals at the end
+        case x =>
+          val Sequence(litLen, matchLen, offset) = x.head
           val (off, newOffs) = offset match {
             case DirectOffset(offset) =>
               (offset, offset +: offsetHistory.dropRight(1))
-            case RepeatedOffset(idx) if litLen > 0 =>
-              val thisOff = offsetHistory(idx)
-              val newOffs = idx match {
-                case 0 => offsetHistory
-                case 1 => Seq(offsetHistory(1), offsetHistory(0), offsetHistory(2))
-                case 2 => Seq(offsetHistory(2), offsetHistory(0), offsetHistory(1))
-              }
-              (thisOff, newOffs)
-
             case RepeatedOffset(idx) =>
-              val thisOff = idx match {
-                case 0 => offsetHistory(1)
-                case 1 => offsetHistory(2)
-                case 2 => offsetHistory(0) - 1
-              }
+              if (litLen > 0) {
+                val thisOff = offsetHistory(idx)
+                val newOffs = idx match {
+                  case 0 => offsetHistory
+                  case 1 => Seq(offsetHistory(1), offsetHistory(0), offsetHistory(2))
+                  case 2 => Seq(offsetHistory(2), offsetHistory(0), offsetHistory(1))
+                }
+                (thisOff, newOffs)
+              } else {
+                val thisOff = idx match {
+                  case 0 => offsetHistory(1)
+                  case 1 => offsetHistory(2)
+                  case 2 => offsetHistory(0) - 1
+                }
 
-              val newOffs = idx match {
-                case 0 => Seq(offsetHistory(1), offsetHistory(0), offsetHistory(2))
-                case 1 => Seq(offsetHistory(2), offsetHistory(0), offsetHistory(1))
-                case 2 => Seq(thisOff, offsetHistory(1), offsetHistory(2))
+                val newOffs = idx match {
+                  case 0 => Seq(offsetHistory(1), offsetHistory(0), offsetHistory(2))
+                  case 1 => Seq(offsetHistory(2), offsetHistory(0), offsetHistory(1))
+                  case 2 => Seq(thisOff, offsetHistory(1), offsetHistory(2))
+                }
+                (thisOff, newOffs)
               }
-              (thisOff, newOffs)
           }
           /** Resolves overlapping matches (probably not in the fastest way) */
-          def includingMatch(window: ByteVector, offset: Int, matchLen: Int): ByteVector = {
+          def includingMatch(offset: Int, matchLen: Int, outputPos: Int): Int = {
+            //println(s"offset: $offset matchLen: $matchLen outputPos: $outputPos size: ${output.length}")
             val thisMatchLen = math.min(matchLen, offset)
             val remainingMatchLen = matchLen - thisMatchLen
-            val after = window ++ window.slice(window.size - off, window.size - off + matchLen)
-            if (remainingMatchLen > 0) includingMatch(after, offset, remainingMatchLen)
+            val after = outputPos + thisMatchLen
+            //window ++ window.slice(window.size - off, window.size - off + matchLen)
+            System.arraycopy(output, outputPos - off, output, outputPos, thisMatchLen)
+            if (remainingMatchLen > 0) includingMatch(offset, remainingMatchLen, after)
             else after
           }
 
-          val all = includingMatch(dec0, off, matchLen)
-          processSequence(all, literals.drop(litLen), newOffs, rest)
+          //val dec0 = literals.take(litLen)
+          System.arraycopy(literals, litPos, output, outputPos, litLen)
+          //literals.copyToArray(output, outputPos, 0, litLen)
+
+          val all = includingMatch(off, matchLen, outputPos + litLen)
+          processSequence(all, literals, litPos + litLen, newOffs, x.tail)
       }
 
-      val result = processNextBlock(ByteVector.empty, InitialOffsetHistory, blocks)
+      val result = processNextBlock(0, InitialOffsetHistory, blocks)
       require(header.frameContentSize == -1 || result.size == header.frameContentSize, s"Result size ${result.size} != frame content size ${header.frameContentSize}")
       result
     }

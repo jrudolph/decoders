@@ -72,8 +72,8 @@ object Zstd {
    * | `Baseline`             | 8192 |16384 |32768 |65536 |
    * | `Number_of_Bits`       |  13  |  14  |  15  |  16  |
    */
-  val LitLenCodeTable: IndexedSeq[Codec[Int]] =
-    intCodeTableWithExtraBits(0, Vector.fill(16)(0) ++ Vector(1, 1, 1, 1, 2, 2, 3, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16))
+  val LitLenCodeTable: CodeTable[Int] =
+    CodeTable.intCodeTableWithExtraBits(0, Vector.fill(16)(0) ++ Vector(1, 1, 1, 1, 2, 2, 3, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16))
 
   /**
    * | `Match_Length_Code` |         0-31            |
@@ -96,8 +96,8 @@ object Zstd {
    * | `Baseline`          | 4099 | 8195 |16387 |32771 |65539 |
    * | `Number_of_Bits`    |  12  |  13  |  14  |  15  |  16  |
    */
-  val MatchLenCodeTable: IndexedSeq[Codec[Int]] =
-    intCodeTableWithExtraBits(3, Vector.fill(32)(0) ++ Vector(1, 1, 1, 1, 2, 2, 3, 3, 4, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16))
+  val MatchLenCodeTable: CodeTable[Int] =
+    CodeTable.intCodeTableWithExtraBits(3, Vector.fill(32)(0) ++ Vector(1, 1, 1, 1, 2, 2, 3, 3, 4, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16))
 
   /**
    * Offset codes are values ranging from `0` to `N`.
@@ -112,15 +112,44 @@ object Zstd {
    *
    * `Offset_Value` from 1 to 3 are special : they define "repeat codes".
    */
-  val OffsetCodeTable: IndexedSeq[Codec[Offset]] =
-    (0 to 31).map { offsetCode =>
-      readExtra(offsetCode).mapD { offsetExtra =>
-        val offsetValue = (1 << offsetCode) + offsetExtra
+  val OffsetCodeTable: CodeTable[Offset] =
+    new CodeTable[Offset] {
+      override def extraBitsForCode(code: Int): Int = code
+      override def symbol(code: Int, extraBitsValue: Int): Offset = {
+        val offsetValue = (1 << code) + extraBitsValue
 
         if (offsetValue > 3) DirectOffset(offsetValue - 3)
         else RepeatedOffset(offsetValue - 1)
       }
     }
+
+  trait CodeTable[T] {
+    def extraBitsForCode(code: Int): Int
+    def symbol(code: Int, extraBitsValue: Int): T
+
+    def decodeSymbol(code: Int): Codec[T] = readExtra(extraBitsForCode(code)).mapD(symbol(code, _))
+  }
+  object CodeTable {
+    def intCodeTableWithExtraBits(base: Int, extraBits: Vector[Int]): CodeTable[Int] = {
+      case class Code(baseline: Int, extraBits: Int)
+
+      val first = extraBits.head
+      val codes =
+        extraBits.tail
+          .scanLeft(Code(base, first)) { (code, nextBits) =>
+            Code(code.baseline + (1 << code.extraBits), nextBits)
+          }
+
+      new CodeTable[Int] {
+        override def extraBitsForCode(code: Int): Int = codes(code).extraBits
+        override def symbol(code: Int, extraBitsValue: Int): Int = codes(code).baseline + extraBitsValue
+      }
+    }
+    val literal: CodeTable[Int] = new CodeTable[Int] {
+      override def extraBitsForCode(code: Int): Int = 0
+      override def symbol(code: Int, extraBitsValue: Int): Int = code
+    }
+  }
 
   /**
    * For the first block, the starting offset history is populated with following values :
@@ -454,7 +483,7 @@ object Zstd {
 
   lazy val huffmanSpec: Codec[HuffmanSpec] =
     fseTableSpec.flatMapD { tableSpec =>
-      val table = tableSpec.toTable((0 to 20).map(provide))
+      val table = tableSpec.toTable(CodeTable.literal)
       trace(s"Huffman table weights FSE: $table")
       def nextValues(state1: Int, state2: Int, current: Seq[Int]): Codec[HuffmanSpec] = {
         val v1Entry = table.entries(state1)
@@ -681,7 +710,7 @@ object Zstd {
       accuracyLog: Int,
       histogram:   Seq[Int]
   ) {
-    def toTable[T](codeTable: Seq[Codec[T]]): FSETable[T] = {
+    def toTable[T](codeTable: CodeTable[T]): FSETable[T] = {
       val size = 1 << accuracyLog
       val mask = size - 1
       val skip = (size >> 1) + (size >> 3) + 3
@@ -692,7 +721,7 @@ object Zstd {
       histogram.zipWithIndex.filter(_._1 == -1).foreach {
         case (_ /* -1 */ , symbol) =>
           require(buffer(lastIdx) == null)
-          buffer(lastIdx) = FSETableEntry(symbol, codeTable(symbol), accuracyLog, 0)
+          buffer(lastIdx) = FSETableEntry(symbol, codeTable.decodeSymbol(symbol), accuracyLog, 0)
           lastIdx -= 1
       }
 
@@ -707,7 +736,7 @@ object Zstd {
       histogram.zipWithIndex.foreach {
         case (count, symbol) =>
           if (count > 0) {
-            val e = FSETableEntry(symbol, codeTable(symbol), -1, -1) // bits and offset to be filled later
+            val e = FSETableEntry(symbol, codeTable.decodeSymbol(symbol), -1, -1) // bits and offset to be filled later
             (0 until count).foreach { _ => allocate(e) }
 
             val nextPower =
@@ -766,17 +795,6 @@ object Zstd {
         case (FSETableEntry(symbol, codec, nbBits, offset), state) =>
           f"$state%4d $nbBits%2d bits at $offset%4d => $symbol"
       }.mkString("\n")
-  }
-
-  private def intCodeTableWithExtraBits(base: Int, extraBits: Vector[Int]): IndexedSeq[Codec[Int]] = {
-    case class Code(baseline: Int, extraBits: Int)
-
-    val first = extraBits.head
-    extraBits.tail
-      .scanLeft(Code(base, first)) { (code, nextBits) =>
-        Code(code.baseline + (1 << code.extraBits), nextBits)
-      }
-      .map(c => readExtra(c.extraBits).mapD(_ + c.baseline))
   }
 
   lazy val fseTableSpec: Codec[FSETableSpec] = withReversedBits {

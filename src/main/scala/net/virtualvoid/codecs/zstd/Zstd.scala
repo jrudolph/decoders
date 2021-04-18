@@ -597,47 +597,47 @@ object Zstd {
   def readExtra(bits: Int): Codec[Int] = if (bits == 0) provide(0) else uint(bits)
 
   def sequences(blockState: BlockState): Codec[Sequences] =
-    sequenceSectionHeader(blockState).flatMapD { header =>
-      val litLenTable = header.litLengthTable.toTable(LitLenCodeTable)
-      val matchLenTable = header.matchLengthTable.toTable(MatchLenCodeTable)
-      val offsetTable = header.offsetTable.toTable(OffsetCodeTable)
+    sequenceSectionHeader(blockState).flatMapD(header => ((provide(header) :: decodeSequences(header)).as[Sequences]))
 
-      trace("Litlen")
-      trace(header.litLengthTable.histogram)
-      trace(litLenTable)
-      trace("MatchLen")
-      trace(header.matchLengthTable.histogram)
-      trace(matchLenTable)
-      trace("Offset")
-      trace(header.offsetTable.histogram)
-      trace(offsetTable)
+  def decodeSequences(header: SequenceSectionHeader): Codec[Seq[Sequence]] = {
+    val litLenTable = header.litLengthTable.toTable(LitLenCodeTable)
+    val matchLenTable = header.matchLengthTable.toTable(MatchLenCodeTable)
+    val offsetTable = header.offsetTable.toTable(OffsetCodeTable)
 
-      reversed {
-        withReversedBits {
-          compact {
-            (padding ~> litLenTable.decodeInitialState :: offsetTable.decodeInitialState :: matchLenTable.decodeInitialState).flatMapD {
-              case litLenState :: offsetState :: matchLenState :: HNil =>
-                trace(litLenState, offsetState, matchLenState)
+    trace("Litlen")
+    trace(header.litLengthTable.histogram)
+    trace(litLenTable)
+    trace("MatchLen")
+    trace(header.matchLengthTable.histogram)
+    trace(matchLenTable)
+    trace("Offset")
+    trace(header.offsetTable.histogram)
+    trace(offsetTable)
 
-                val seqs = Utils.collectWithState(header.numberOfSequences :: litLenState :: matchLenState :: offsetState :: HNil) {
-                  case remaining :: litLenState :: matchLenState :: offsetState :: HNil =>
-                    //trace(s"Remaining: $remaining ll: $litLenState ml: $matchLenState o: $offsetState")
-                    val nextSeq =
-                      (offsetState.decodeSymbol :: matchLenState.decodeSymbol :: litLenState.decodeSymbol).mapD {
-                        case offset :: matchLen :: litLen :: HNil => Sequence(litLen, matchLen, offset)
-                      }
+    reversed {
+      withReversedBits {
+        compact {
+          (padding ~> litLenTable.decodeInitialState :: offsetTable.decodeInitialState :: matchLenTable.decodeInitialState).flatMapD {
+            case litLenState :: offsetState :: matchLenState :: HNil =>
+              trace(litLenState, offsetState, matchLenState)
 
-                    val nextState = conditional(remaining > 1, provide(remaining - 1) :: litLenState.decodeNextState :: matchLenState.decodeNextState :: offsetState.decodeNextState)
+              Utils.collectWithState(header.numberOfSequences :: litLenState :: matchLenState :: offsetState :: HNil) {
+                case remaining :: litLenState :: matchLenState :: offsetState :: HNil =>
+                  //trace(s"Remaining: $remaining ll: $litLenState ml: $matchLenState o: $offsetState")
+                  val nextSeq =
+                    (offsetState.decodeSymbol :: matchLenState.decodeSymbol :: litLenState.decodeSymbol).mapD {
+                      case offset :: matchLen :: litLen :: HNil => Sequence(litLen, matchLen, offset)
+                    }
 
-                    nextSeq ~ nextState
-                }
+                  val nextState = conditional(remaining > 1, provide(remaining - 1) :: litLenState.decodeNextState :: matchLenState.decodeNextState :: offsetState.decodeNextState)
 
-                (provide(header) :: seqs).as[Sequences]
-            }
+                  nextSeq ~ nextState
+              }
           }
         }
       }
     }
+  }
 
   case class SequenceSectionHeader(
       numberOfSequences: Int,

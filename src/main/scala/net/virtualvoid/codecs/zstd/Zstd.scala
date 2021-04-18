@@ -2,7 +2,7 @@ package net.virtualvoid.codecs.zstd
 
 import net.virtualvoid.codecs.Utils
 import Utils._
-import scodec.Codec
+import scodec.{ Attempt, Codec, DecodeResult, SizeBound }
 import scodec.bits.{ BitVector, ByteVector, HexStringSyntax }
 import scodec.codecs._
 import shapeless._
@@ -522,6 +522,56 @@ object Zstd {
   }
 
   def decodeLiteralStream(huffmanSpec: HuffmanSpec, numElements: Int): Codec[ByteVector] = {
+    val table = huffmanSpec.toTable
+    new Codec[ByteVector] {
+      override def sizeBound: SizeBound = SizeBound.unknown
+      override def encode(value: ByteVector): Attempt[BitVector] = ???
+
+      override def decode(bits: BitVector): Attempt[DecodeResult[ByteVector]] = {
+        val result = new Array[Byte](numElements)
+        val inputBuf = bits.bytes
+
+        @tailrec
+        def decodeNext(readPadding: Boolean, inputBufPos: Long, readBuf: Long, bits: Int, outputBufPos: Int): Attempt[DecodeResult[ByteVector]] =
+          if (outputBufPos < result.size) {
+            var iPos = inputBufPos
+            var buf = readBuf
+            var bs = bits
+            // refill bits as necessary
+            if (bs < 16) // only fill when almost empty (could also be maxNumberOfBits if we know the max good enough
+              while (bs <= 56 && iPos >= 0) {
+                val nextByte = (inputBuf(iPos) & 0xff).toLong
+                buf = buf | (nextByte << (56 - bs))
+                iPos -= 1
+                bs += 8
+                //println(s"filling up with nextByte ${nextByte.toHexString}")
+                //println(s"Buf is now filled with $bs bits: ${buf.toBinaryString}")
+              }
+            //println(s"Buf is now filled with $bs bits: ${buf.toBinaryString}")
+            if (readPadding) {
+              val p = java.lang.Long.numberOfLeadingZeros(buf)
+              require(p < 8)
+              buf = buf << (p + 1)
+              bs -= p + 1
+              //println(s"after padding Buf is now filled with $bs bits: ${buf.toBinaryString}")
+            }
+
+            val i = buf >>> (64 - table.maxNumberOfBits)
+            val e = table.read(i.toInt)
+            //println(s"read code ${i.toBinaryString} entry ${e.toString(table.maxNumberOfBits)}")
+            buf = buf << e.numberOfBits
+            bs -= e.numberOfBits
+
+            result(outputBufPos) = e.symbol.toByte
+            decodeNext(false, iPos, buf, bs, outputBufPos + 1)
+          } else Attempt.Successful(DecodeResult(ByteVector(result), BitVector.empty))
+
+        decodeNext(true, inputBuf.size - 1, readBuf = 0, bits = 0, outputBufPos = 0)
+      }
+    }
+  }
+
+  def decodeLiteralStream2(huffmanSpec: HuffmanSpec, numElements: Int): Codec[ByteVector] = {
     val table = huffmanSpec.toTable
 
     reversed {

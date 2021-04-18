@@ -561,7 +561,7 @@ object Zstd {
         val inputBuf = bits.bytes
 
         @tailrec
-        def decodeNext(readPadding: Boolean, inputBufPos: Long, readBuf: Long, bits: Int, outputBufPos: Int): Attempt[DecodeResult[ByteVector]] =
+        def decodeNextLiteral(readPadding: Boolean, inputBufPos: Long, readBuf: Long, bits: Int, outputBufPos: Int): Attempt[DecodeResult[ByteVector]] =
           if (outputBufPos < result.size) {
             var iPos = inputBufPos
             var buf = readBuf
@@ -592,10 +592,10 @@ object Zstd {
             bs -= e.numberOfBits
 
             result(outputBufPos) = e.symbol.toByte
-            decodeNext(false, iPos, buf, bs, outputBufPos + 1)
+            decodeNextLiteral(false, iPos, buf, bs, outputBufPos + 1)
           } else Attempt.Successful(DecodeResult(ByteVector(result), BitVector.empty))
 
-        decodeNext(true, inputBuf.size - 1, readBuf = 0, bits = 0, outputBufPos = 0)
+        decodeNextLiteral(true, inputBuf.size - 1, readBuf = 0, bits = 0, outputBufPos = 0)
       }
     }
   }
@@ -628,7 +628,119 @@ object Zstd {
   def sequences(blockState: BlockState): Codec[Sequences] =
     sequenceSectionHeader(blockState).flatMapD(header => ((provide(header) :: decodeSequences(header)).as[Sequences]))
 
-  def decodeSequences(header: SequenceSectionHeader): Codec[Seq[Sequence]] = {
+  def decodeSequences(header: SequenceSectionHeader): Codec[Seq[Sequence]] = new Codec[Seq[Sequence]] {
+    val litLenTable = header.litLengthTable.toTable(LitLenCodeTable)
+    val matchLenTable = header.matchLengthTable.toTable(MatchLenCodeTable)
+    val offsetTable = header.offsetTable.toTable(OffsetCodeTable)
+
+    /*println("Litlen")
+    println(header.litLengthTable.histogram)
+    println(litLenTable)
+    println("MatchLen")
+    println(header.matchLengthTable.histogram)
+    println(matchLenTable)
+    println("Offset")
+    println(header.offsetTable.histogram)
+    println(offsetTable)*/
+
+    override def decode(bits: BitVector): Attempt[DecodeResult[Seq[Sequence]]] = {
+      val result = new Array[Sequence](header.numberOfSequences)
+      val inputBuf = bits.bytes
+      //println(s"Reading ${result.size} sequences from ${inputBuf.size} bytes")
+
+      @tailrec
+      def decodeNextSequence(readHeader: Boolean, inputBufPos: Long, readBuf: Long, bits: Int, outputBufPos: Int, litLenState: Int, matchLenState: Int, offsetState: Int): Attempt[DecodeResult[Seq[Sequence]]] =
+        if (outputBufPos < result.size) {
+          var iPos = inputBufPos
+          var buf = readBuf
+          var bs = bits
+          // refill bits as necessary
+          //if (bs < 16) // only fill when almost empty (could also be maxNumberOfBits if we know the max good enough
+          while (bs <= 56 && iPos >= 0) {
+            val nextByte = (inputBuf(iPos) & 0xff).toLong
+            buf = buf | (nextByte << (56 - bs))
+            iPos -= 1
+            bs += 8
+            //println(s"filling up with nextByte ${nextByte.toHexString}")
+            //println(s"Buf is now filled with $bs bits: ${buf.toBinaryString}")
+          }
+
+          //println(s"Buf is now filled with $bs bits: ${buf.toBinaryString}")
+          if (readHeader) {
+            // strip off padding
+            val p = java.lang.Long.numberOfLeadingZeros(buf)
+            require(p < 8)
+            buf = buf << (p + 1)
+            bs -= p + 1
+
+            // litlen, offset, matchlen
+            val litLenState = buf >>> (64 - litLenTable.accuracyLog)
+            val offsetState = (buf << litLenTable.accuracyLog) >>> (64 - offsetTable.accuracyLog)
+            val matchLenState = (buf << (litLenTable.accuracyLog + offsetTable.accuracyLog)) >>> (64 - matchLenTable.accuracyLog)
+            val allBits = litLenTable.accuracyLog + offsetTable.accuracyLog + matchLenTable.accuracyLog
+            buf = buf << allBits
+            bs -= allBits
+            //println("read header")
+            decodeNextSequence(false, iPos, buf, bs, outputBufPos, litLenState.toInt, matchLenState.toInt, offsetState.toInt)
+            //println(s"after padding Buf is now filled with $bs bits: ${buf.toBinaryString}")
+          } else {
+            //println(s"At state ll $litLenState ml $matchLenState o $offsetState")
+
+            // off, match, lit
+            val llEntry = litLenTable.entries(litLenState)
+            val mEntry = matchLenTable.entries(matchLenState)
+            val oEntry = offsetTable.entries(offsetState)
+
+            val oBits = OffsetCodeTable.extraBitsForCode(oEntry.symbol)
+            val oExtra = if (oBits == 0) 0 else buf >>> (64 - oBits)
+            val oSym = OffsetCodeTable.symbol(oEntry.symbol, oExtra.toInt)
+
+            val mBits = MatchLenCodeTable.extraBitsForCode(mEntry.symbol)
+            val mExtra = if (mBits == 0) 0 else (buf << oBits) >>> (64 - mBits)
+            val mSym = MatchLenCodeTable.symbol(mEntry.symbol, mExtra.toInt)
+
+            val llBits = LitLenCodeTable.extraBitsForCode(llEntry.symbol)
+            val llExtra = if (llBits == 0) 0 else (buf << (oBits + mBits)) >>> (64 - llBits)
+            val llSym = LitLenCodeTable.symbol(llEntry.symbol, llExtra.toInt)
+
+            //println(s"oBits: $oBits oExtra: $oExtra oSym: $oSym")
+            //println(s"mBits: $mBits mExtra: $mExtra mSym: $mSym")
+            //println(s"llBits: $llBits llExtra: $llExtra llSym: $llSym")
+
+            val allBits = oBits + mBits + llBits
+            //println(s"allBits: $allBits $bs $iPos")
+            buf = buf << allBits
+            bs -= allBits
+
+            result(outputBufPos) = Sequence(llSym, mSym, oSym)
+
+            if (outputBufPos + 1 < result.size) {
+              // ll, ml, o
+              val llStateOffset = if (llEntry.nbBits == 0) 0 else buf >>> (64 - llEntry.nbBits)
+              val mlStateOffset = if (mEntry.nbBits == 0) 0 else (buf << llEntry.nbBits) >>> (64 - mEntry.nbBits)
+              val oStateOffset = if (oEntry.nbBits == 0) 0 else (buf << (llEntry.nbBits + mEntry.nbBits)) >>> (64 - oEntry.nbBits)
+              val allOBits = llEntry.nbBits + mEntry.nbBits + oEntry.nbBits
+              //println(s"allOBits: $allOBits $bs $iPos")
+              buf = buf << allOBits
+              bs -= allOBits
+              require(bs >= 0, s"read more bits than available $bs")
+
+              val newLitLenState = llStateOffset + llEntry.offset
+              val newMatchLenState = mlStateOffset + mEntry.offset
+              val newOffsetState = oStateOffset + oEntry.offset
+              decodeNextSequence(false, iPos, buf, bs, outputBufPos + 1, newLitLenState.toInt, newMatchLenState.toInt, newOffsetState.toInt)
+            } else Attempt.Successful(DecodeResult(result.toSeq, BitVector.empty))
+          }
+        } else Attempt.Successful(DecodeResult(result.toSeq, BitVector.empty))
+
+      decodeNextSequence(true, inputBuf.size - 1, readBuf = 0, bits = 0, outputBufPos = 0, -1, -1, -1)
+    }
+
+    override def sizeBound: SizeBound = SizeBound.unknown
+    override def encode(value: Seq[Sequence]): Attempt[BitVector] = ???
+  }
+
+  def decodeSequences2(header: SequenceSectionHeader): Codec[Seq[Sequence]] = {
     val litLenTable = header.litLengthTable.toTable(LitLenCodeTable)
     val matchLenTable = header.matchLengthTable.toTable(MatchLenCodeTable)
     val offsetTable = header.offsetTable.toTable(OffsetCodeTable)
@@ -780,13 +892,14 @@ object Zstd {
   case class FSETable[T](accuracyLog: Int, entries: IndexedSeq[FSETableEntry[T]]) {
     def decodeInitialState: Codec[FSEState[T]] = uint(accuracyLog).mapD(states)
 
-    private val states: IndexedSeq[FSEState[T]] = entries.map { e =>
-      new FSEState[T] {
-        override def decodeSymbol: Codec[T] = e.decodeSymbol
-        override def decodeNextState: Codec[FSEState[T]] = readExtra(e.nbBits).mapD(bs => states(e.offset + bs))
+    private val states: IndexedSeq[FSEState[T]] = entries.zipWithIndex.map {
+      case (e, idx) =>
+        new FSEState[T] {
+          override def decodeSymbol: Codec[T] = e.decodeSymbol
+          override def decodeNextState: Codec[FSEState[T]] = readExtra(e.nbBits).mapD(bs => states(e.offset + bs))
 
-        override def toString: String = s"State ${e.symbol}"
-      }
+          override def toString: String = s"State ${e.symbol} idx $idx"
+        }
     }
 
     override def toString: String =

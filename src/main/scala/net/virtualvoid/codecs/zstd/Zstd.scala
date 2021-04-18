@@ -605,10 +605,10 @@ object Zstd {
 
       override def decode(bits: BitVector): Attempt[DecodeResult[ByteVector]] = {
         val result = new Array[Byte](numElements)
-        val inputBuf = bits.bytes
+        val inputBuf = bits.bytes.toArray
 
         @tailrec
-        def decodeNextLiteral(readPadding: Boolean, inputBufPos: Long, readBuf: Long, bits: Int, outputBufPos: Int): Attempt[DecodeResult[ByteVector]] =
+        def decodeNextLiteral(readPadding: Boolean, inputBufPos: Int, readBuf: Long, bits: Int, outputBufPos: Int): Attempt[DecodeResult[ByteVector]] =
           if (outputBufPos < result.size) {
             var iPos = inputBufPos
             var buf = readBuf
@@ -692,11 +692,11 @@ object Zstd {
 
     override def decode(bits: BitVector): Attempt[DecodeResult[Seq[Sequence]]] = {
       val result = new Array[Sequence](header.numberOfSequences)
-      val inputBuf = bits.bytes
+      val inputBuf = bits.bytes.toArray
       //println(s"Reading ${result.size} sequences from ${inputBuf.size} bytes")
 
       @tailrec
-      def decodeNextSequence(readHeader: Boolean, inputBufPos: Long, readBuf: Long, bits: Int, outputBufPos: Int, litLenState: Int, matchLenState: Int, offsetState: Int): Attempt[DecodeResult[Seq[Sequence]]] =
+      def decodeNextSequence(readHeader: Boolean, inputBufPos: Int, readBuf: Long, bits: Int, outputBufPos: Int, litLenState: Int, matchLenState: Int, offsetState: Int): Attempt[DecodeResult[Seq[Sequence]]] =
         if (outputBufPos < result.size) {
           var iPos = inputBufPos
           var buf = readBuf

@@ -79,5 +79,5 @@ object Utils {
     peek(bytes.mapD { bv => trace(s"$tag: ${bv.size} bytes ${bv.toHex}") })
 
   private val TRACE = false
-  def trace(o: Any): Unit = if (TRACE) trace(o.toString)
+  def trace(o: Any): Unit = if (TRACE) println(o.toString)
 }

@@ -475,10 +475,12 @@ object Zstd {
 
       reversed {
         withReversedBits {
-          (padding ~> uint(tableSpec.accuracyLog) :: uint(tableSpec.accuracyLog)).flatMapD {
-            case state1 :: state2 :: HNil =>
-              trace(s"Start states state1: $state1 state2: $state2")
-              nextValues(state1, state2, Nil)
+          compact {
+            (padding ~> uint(tableSpec.accuracyLog) :: uint(tableSpec.accuracyLog)).flatMapD {
+              case state1 :: state2 :: HNil =>
+                trace(s"Start states state1: $state1 state2: $state2")
+                nextValues(state1, state2, Nil)
+            }
           }
         }
       }
@@ -525,16 +527,18 @@ object Zstd {
     reversed {
       withReversedBits {
         appendInput(ByteVector(0)) {
-          def readOne: Codec[Int] =
-            peek(uint(table.maxNumberOfBits)).flatMapD { v =>
-              //trace(s"Read ${v.toBinaryString}")
-              val entry = table.read(v)
-              //trace(s"${char(entry.symbol)} Found entry: $entry")
+          compact {
+            def readOne: Codec[Int] =
+              peek(uint(table.maxNumberOfBits)).flatMapD { v =>
+                //trace(s"Read ${v.toBinaryString}")
+                val entry = table.read(v)
+                //trace(s"${char(entry.symbol)} Found entry: $entry")
 
-              ignore(entry.numberOfBits) ~> provide(entry.symbol)
-            }
+                ignore(entry.numberOfBits) ~> provide(entry.symbol)
+              }
 
-          padding ~> vectorOfN(provide(numElements), readOne).mapD[ByteVector](bs => ByteVector(bs: _*))
+            padding ~> vectorOfN(provide(numElements), readOne).mapD[ByteVector](bs => ByteVector(bs: _*))
+          }
         }
       }
     }
@@ -560,24 +564,26 @@ object Zstd {
 
       reversed {
         withReversedBits {
-          (padding ~> litLenTable.decodeInitialState :: offsetTable.decodeInitialState :: matchLenTable.decodeInitialState).flatMapD {
-            case litLenState :: offsetState :: matchLenState :: HNil =>
-              trace(litLenState, offsetState, matchLenState)
+          compact {
+            (padding ~> litLenTable.decodeInitialState :: offsetTable.decodeInitialState :: matchLenTable.decodeInitialState).flatMapD {
+              case litLenState :: offsetState :: matchLenState :: HNil =>
+                trace(litLenState, offsetState, matchLenState)
 
-              val seqs = Utils.collectWithState(header.numberOfSequences :: litLenState :: matchLenState :: offsetState :: HNil) {
-                case remaining :: litLenState :: matchLenState :: offsetState :: HNil =>
-                  //trace(s"Remaining: $remaining ll: $litLenState ml: $matchLenState o: $offsetState")
-                  val nextSeq =
-                    (offsetState.decodeSymbol :: matchLenState.decodeSymbol :: litLenState.decodeSymbol).mapD {
-                      case offset :: matchLen :: litLen :: HNil => Sequence(litLen, matchLen, offset)
-                    }
+                val seqs = Utils.collectWithState(header.numberOfSequences :: litLenState :: matchLenState :: offsetState :: HNil) {
+                  case remaining :: litLenState :: matchLenState :: offsetState :: HNil =>
+                    //trace(s"Remaining: $remaining ll: $litLenState ml: $matchLenState o: $offsetState")
+                    val nextSeq =
+                      (offsetState.decodeSymbol :: matchLenState.decodeSymbol :: litLenState.decodeSymbol).mapD {
+                        case offset :: matchLen :: litLen :: HNil => Sequence(litLen, matchLen, offset)
+                      }
 
-                  val nextState = conditional(remaining > 1, provide(remaining - 1) :: litLenState.decodeNextState :: matchLenState.decodeNextState :: offsetState.decodeNextState)
+                    val nextState = conditional(remaining > 1, provide(remaining - 1) :: litLenState.decodeNextState :: matchLenState.decodeNextState :: offsetState.decodeNextState)
 
-                  nextSeq ~ nextState
-              }
+                    nextSeq ~ nextState
+                }
 
-              (provide(header) :: seqs).as[Sequences]
+                (provide(header) :: seqs).as[Sequences]
+            }
           }
         }
       }

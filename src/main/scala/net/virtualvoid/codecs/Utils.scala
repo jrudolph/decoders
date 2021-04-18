@@ -55,6 +55,7 @@ object Utils {
    */
   def withReversedBits[T](inner: Codec[T]): Codec[T] = mapInputBits(_.reverseBitOrder)(inner)
   def reversed[T](inner: Codec[T]): Codec[T] = mapInputBits(_.reverse)(inner)
+  def compact[T](inner: Codec[T]): Codec[T] = mapInputBits(_.compact)(inner)
   def appendInput[T](byteVector: ByteVector)(inner: Codec[T]): Codec[T] =
     mapInputBits(_ ++ byteVector.toBitVector, _.dropRight(byteVector.length * 8))(inner)
 

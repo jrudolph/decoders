@@ -172,34 +172,54 @@ object Zstd {
     /** Do the actual LZ decoding. It keeps the full output in memory for simplicity */
     def decode: ByteVector = {
       val output = new Array[Byte](header.frameContentSize.toInt)
+      val offsetHistory = InitialOffsetHistory.toArray
       @tailrec
-      def processNextBlock(outputPos: Int, offsetHistory: Seq[Int], blocks: Seq[Block]): ByteVector = blocks match {
-        case Nil => ByteVector(output)
+      def processNextBlock(outputPos: Int, blocks: Seq[Block]): ByteVector = blocks match {
+        case Nil =>
+          require(outputPos == header.frameContentSize.toInt)
+          ByteVector(output)
         case CompressedBlock(_, Literals(_, _, lits), Sequences(_, seqs)) +: rest =>
-          val (newOutputPos, lastOffs) = processSequence(outputPos, lits.toArray, 0, offsetHistory, seqs)
-          processNextBlock(newOutputPos, lastOffs, rest)
+          val newOutputPos = processSequence(outputPos, lits.toArray, 0, seqs, 0)
+          processNextBlock(newOutputPos, rest)
       }
       @tailrec
-      def processSequence(outputPos: Int, literals: Array[Byte], litPos: Int, offsetHistory: Seq[Int], sequences: Seq[Sequence]): (Int, Seq[Int]) = sequences match {
-        case Nil =>
+      def processSequence(outputPos: Int, literals: Array[Byte], litPos: Int, sequences: Seq[Sequence], seqPos: Int): Int =
+        if (seqPos >= sequences.size) {
           if (litPos < literals.length)
             System.arraycopy(literals, litPos, output, outputPos, literals.length - litPos)
           //literals.copyToArray(output, outputPos)
-          (outputPos + (literals.length - litPos), offsetHistory) // append remaining literals at the end
-        case x =>
-          val Sequence(litLen, matchLen, offset) = x.head
-          val (off, newOffs) = offset match {
+          outputPos + (literals.length - litPos) // append remaining literals at the end
+        } else {
+          val s = sequences(seqPos)
+          val litLen = s.literalLen
+          val matchLen = s.matchLen
+          val offset = s.offset
+          val off = offset match {
             case DirectOffset(offset) =>
-              (offset, offset +: offsetHistory.dropRight(1))
+              offsetHistory(1) = offsetHistory(0)
+              offsetHistory(2) = offsetHistory(1)
+              offsetHistory(0) = offset
+              offset
             case RepeatedOffset(idx) =>
               if (litLen > 0) {
                 val thisOff = offsetHistory(idx)
-                val newOffs = idx match {
-                  case 0 => offsetHistory
-                  case 1 => Seq(offsetHistory(1), offsetHistory(0), offsetHistory(2))
-                  case 2 => Seq(offsetHistory(2), offsetHistory(0), offsetHistory(1))
+
+                idx match {
+                  case 0 =>
+                  case 1 =>
+                    val x = offsetHistory(0)
+                    offsetHistory(0) = offsetHistory(1)
+                    offsetHistory(1) = x
+                  // swap 0 and 1
+                  case 2 =>
+                    val x = offsetHistory(0)
+                    offsetHistory(0) = offsetHistory(2)
+                    offsetHistory(2) = offsetHistory(1)
+                    offsetHistory(1) = x
+                  //Seq(offsetHistory(2), offsetHistory(0), offsetHistory(1))
                 }
-                (thisOff, newOffs)
+
+                thisOff
               } else {
                 val thisOff = idx match {
                   case 0 => offsetHistory(1)
@@ -207,12 +227,20 @@ object Zstd {
                   case 2 => offsetHistory(0) - 1
                 }
 
-                val newOffs = idx match {
-                  case 0 => Seq(offsetHistory(1), offsetHistory(0), offsetHistory(2))
-                  case 1 => Seq(offsetHistory(2), offsetHistory(0), offsetHistory(1))
-                  case 2 => Seq(thisOff, offsetHistory(1), offsetHistory(2))
+                idx match {
+                  case 0 =>
+                    val x = offsetHistory(0)
+                    offsetHistory(0) = offsetHistory(1)
+                    offsetHistory(1) = x
+                  case 1 =>
+                    val x = offsetHistory(0)
+                    offsetHistory(0) = offsetHistory(2)
+                    offsetHistory(2) = offsetHistory(1)
+                    offsetHistory(1) = x
+                  case 2 =>
+                    offsetHistory(0) = thisOff
                 }
-                (thisOff, newOffs)
+                thisOff
               }
           }
           /** Resolves overlapping matches (probably not in the fastest way) */
@@ -232,10 +260,10 @@ object Zstd {
           //literals.copyToArray(output, outputPos, 0, litLen)
 
           val all = includingMatch(off, matchLen, outputPos + litLen)
-          processSequence(all, literals, litPos + litLen, newOffs, x.tail)
-      }
+          processSequence(all, literals, litPos + litLen, sequences, seqPos + 1)
+        }
 
-      val result = processNextBlock(0, InitialOffsetHistory, blocks)
+      val result = processNextBlock(0, blocks)
       require(header.frameContentSize == -1 || result.size == header.frameContentSize, s"Result size ${result.size} != frame content size ${header.frameContentSize}")
       result
     }

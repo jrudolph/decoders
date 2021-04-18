@@ -11,47 +11,6 @@ import scala.annotation.tailrec
 
 object Zstd {
   /**
-   * The decoding table uses an accuracy log of 6 bits (64 states).
-   *
-   * ```
-   * short literalsLength_defaultDistribution[36] =
-   *         { 4, 3, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1,
-   *           2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 2, 1, 1, 1, 1, 1,
-   *          -1,-1,-1,-1 };
-   * ```
-   */
-  val DefaultLitLenTable =
-    FSETableSpec(6, Seq(4, 3, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 2, 1, 1, 1, 1, 1, -1, -1, -1, -1))
-
-  /**
-   * The decoding table uses an accuracy log of 6 bits (64 states).
-   * ```
-   * short matchLengths_defaultDistribution[53] =
-   *         { 1, 4, 3, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1,
-   *           1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-   *           1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,-1,-1,
-   *          -1,-1,-1,-1,-1 };
-   * ```
-   */
-  val DefaultMatchLenTable =
-    FSETableSpec(6, Seq(1, 4, 3, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1, -1, -1))
-
-  /**
-   * The decoding table uses an accuracy log of 5 bits (32 states),
-   * and supports a maximum `N` value of 28, allowing offset values up to 536,870,908 .
-   *
-   * If any sequence in the compressed block requires a larger offset than this,
-   * it's not possible to use the default distribution to represent it.
-   * ```
-   * short offsetCodes_defaultDistribution[29] =
-   *         { 1, 1, 1, 1, 1, 1, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1,
-   *           1, 1, 1, 1, 1, 1, 1, 1,-1,-1,-1,-1,-1 };
-   * ```
-   */
-  val DefaultOffsetTable =
-    FSETableSpec(5, Seq(1, 1, 1, 1, 1, 1, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1))
-
-  /**
    * | `Literals_Length_Code` |         0-15           |
    * | ---------------------- | ---------------------- |
    * | length                 | `Literals_Length_Code` |
@@ -122,6 +81,53 @@ object Zstd {
         else RepeatedOffset(offsetValue - 1)
       }
     }
+
+  /**
+   * The decoding table uses an accuracy log of 6 bits (64 states).
+   *
+   * ```
+   * short literalsLength_defaultDistribution[36] =
+   *         { 4, 3, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1,
+   *           2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 2, 1, 1, 1, 1, 1,
+   *          -1,-1,-1,-1 };
+   * ```
+   */
+  val DefaultLitLenTableSpec =
+    FSETableSpec(6, Seq(4, 3, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 2, 1, 1, 1, 1, 1, -1, -1, -1, -1))
+
+  val DefaultLitLenTable = DefaultLitLenTableSpec.toTable(LitLenCodeTable)
+
+  /**
+   * The decoding table uses an accuracy log of 6 bits (64 states).
+   * ```
+   * short matchLengths_defaultDistribution[53] =
+   *         { 1, 4, 3, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1,
+   *           1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+   *           1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,-1,-1,
+   *          -1,-1,-1,-1,-1 };
+   * ```
+   */
+  val DefaultMatchLenTableSpec =
+    FSETableSpec(6, Seq(1, 4, 3, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1, -1, -1))
+
+  val DefaultMatchLenTable = DefaultMatchLenTableSpec.toTable(MatchLenCodeTable)
+
+  /**
+   * The decoding table uses an accuracy log of 5 bits (32 states),
+   * and supports a maximum `N` value of 28, allowing offset values up to 536,870,908 .
+   *
+   * If any sequence in the compressed block requires a larger offset than this,
+   * it's not possible to use the default distribution to represent it.
+   * ```
+   * short offsetCodes_defaultDistribution[29] =
+   *         { 1, 1, 1, 1, 1, 1, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1,
+   *           1, 1, 1, 1, 1, 1, 1, 1,-1,-1,-1,-1,-1 };
+   * ```
+   */
+  val DefaultOffsetTableSpec =
+    FSETableSpec(5, Seq(1, 1, 1, 1, 1, 1, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1))
+
+  val DefaultOffsetTable = DefaultOffsetTableSpec.toTable(OffsetCodeTable)
 
   trait CodeTable[T] {
     def extraBitsForCode(code: Int): Int
@@ -342,9 +348,9 @@ object Zstd {
   /** State that needs to be maintained between blocks */
   case class BlockState(
       huffmanSpec:   Option[HuffmanSpec],
-      litLenTable:   Option[FSETableSpec],
-      matchLenTable: Option[FSETableSpec],
-      offsetTable:   Option[FSETableSpec]
+      litLenTable:   Option[FSETable[Int]],
+      matchLenTable: Option[FSETable[Int]],
+      offsetTable:   Option[FSETable[Offset]]
   )
   object BlockState {
     def initial: BlockState = BlockState(None, None, None, None)
@@ -642,9 +648,9 @@ object Zstd {
     sequenceSectionHeader(blockState).flatMapD(header => ((provide(header) :: decodeSequences(header)).as[Sequences]))
 
   def decodeSequences(header: SequenceSectionHeader): Codec[Seq[Sequence]] = new Codec[Seq[Sequence]] {
-    val litLenTable = header.litLengthTable.toTable(LitLenCodeTable)
-    val matchLenTable = header.matchLengthTable.toTable(MatchLenCodeTable)
-    val offsetTable = header.offsetTable.toTable(OffsetCodeTable)
+    val litLenTable = header.litLengthTable
+    val matchLenTable = header.matchLengthTable
+    val offsetTable = header.offsetTable
 
     /*println("Litlen")
     println(header.litLengthTable.histogram)
@@ -754,18 +760,18 @@ object Zstd {
   }
 
   def decodeSequences2(header: SequenceSectionHeader): Codec[Seq[Sequence]] = {
-    val litLenTable = header.litLengthTable.toTable(LitLenCodeTable)
-    val matchLenTable = header.matchLengthTable.toTable(MatchLenCodeTable)
-    val offsetTable = header.offsetTable.toTable(OffsetCodeTable)
+    val litLenTable = header.litLengthTable
+    val matchLenTable = header.matchLengthTable
+    val offsetTable = header.offsetTable
 
     trace("Litlen")
-    trace(header.litLengthTable.histogram)
+    //trace(header.litLengthTable.histogram)
     trace(litLenTable)
     trace("MatchLen")
-    trace(header.matchLengthTable.histogram)
+    //trace(header.matchLengthTable.histogram)
     trace(matchLenTable)
     trace("Offset")
-    trace(header.offsetTable.histogram)
+    //trace(header.offsetTable.histogram)
     trace(offsetTable)
 
     reversed {
@@ -798,24 +804,26 @@ object Zstd {
       litLengthMode:     Int,
       offsetMode:        Int,
       matchLengthMode:   Int,
-      litLengthTable:    FSETableSpec,
-      offsetTable:       FSETableSpec,
-      matchLengthTable:  FSETableSpec
+      litLengthTable:    FSETable[Int],
+      offsetTable:       FSETable[Offset],
+      matchLengthTable:  FSETable[Int]
   )
 
   def sequenceSectionHeader(blockState: BlockState): Codec[SequenceSectionHeader] =
     "sequenceSectionHeader" | (numberOfSequences :: uint2 :: uint2 :: uint2 :: ("reserved sequence section modes" | constant(BitVector.bits(Iterable(false, false))))).flatConcat {
       case num :: lMode :: oMode :: mLMode :: _ :: HNil =>
-        def tableFor(mode: Int, defaultSpec: FSETableSpec, previous: BlockState => Option[FSETableSpec]): Codec[FSETableSpec] = {
+        def tableFor[T](mode: Int, defaultSpec: FSETable[T], previous: BlockState => Option[FSETable[T]], codeTable: CodeTable[T]): Codec[FSETable[T]] = {
           mode match {
             case 0 => provide(defaultSpec)
-            case 2 => fseTableSpec
+            case 2 => fseTableSpec.mapD(_.toTable(codeTable))
             case 3 => provide(previous(blockState).getOrElse(throw new IllegalStateException("Treeless_Literals_Block but previous instance was missing")))
           }
         }
-        trace(s"num seqs $num modes $lMode $oMode $mLMode")
+        //trace(s"num seqs $num modes $lMode $oMode $mLMode")
 
-        tableFor(lMode, DefaultLitLenTable, _.litLenTable) :: tableFor(oMode, DefaultOffsetTable, _.offsetTable) :: tableFor(mLMode, DefaultMatchLenTable, _.matchLenTable)
+        tableFor(lMode, DefaultLitLenTable, _.litLenTable, LitLenCodeTable) ::
+          tableFor(oMode, DefaultOffsetTable, _.offsetTable, OffsetCodeTable) ::
+          tableFor(mLMode, DefaultMatchLenTable, _.matchLenTable, MatchLenCodeTable)
     }
       .as[SequenceSectionHeader]
 
